@@ -1,0 +1,12 @@
+*__pycache__
+
+*.key
+*.csv
+
+data/
+UniDepth/
+sam2/
+GroundingDINO/
+results/
+
+venv/
