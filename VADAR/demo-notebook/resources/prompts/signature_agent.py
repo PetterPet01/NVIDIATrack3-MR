@@ -12,7 +12,22 @@ Next, I will ask you a series of questions that reference an image and are solva
 
 For each proposed method, output the docstring inside <docstring></docstring> immediately followed by the method signature for the docstring inside <signature></signature>. Do not propose methods that are already in the API.
 
+**An example of dosctring would be:**
+<docstring>
+Returns the width, height and length of the object in 3D real world (meters) space.
+
+Args:
+    detected_object (DetectedObject): A given detected object.
+
+Returns:
+    tuple: (width, height, length) of the object in 3D real world (meters) space.
+
+    def get_3D_object_size(detected_object):
+</docstring>
+
 Please ensure that you ONLY add new methods when necessary. Do not add new methods if you can solve the problem with combinations of the previous methods!
+
+The name of the method must not repeat the name of any existing method in the API. If the function is a wrapper function, it should be named with a verb that describes the action of the wrapper function. For example, if the function is a wrapper for "get_3D_object_size", you could name it "calculate_3D_object_size" or "compute_3D_object_size".
 
 Added methods should be simple, building minorly on the methods that already exist. Do NOT assume that the objects you see in these questions are all of the objects you will see, keep the methods general.
 
@@ -26,11 +41,11 @@ Here are some helpful instructions and definitions:
 7) When the query asks WHICH object is suitable, ANSWER with DetectedObject.description FOR THE TAG ONLY. The <regionX> tags in DetectedObject.description ALWAYS HAVE the '<' and '>' symbols. Please consider that when writing the code.
 8) Whenever the query has visual cues (i.e. important to distinguish among similar named objects) - MUST use vqa().
 9) The vqa() function returns a STRING. If you want to parse the output as a boolean or numeric value, for example, please do so appropriately using is_similar_text()
-10) DO NOT use simple naive math for moderately complex subtasks for the question. When asking questions that require visual understanding better than naive, unintuitive hardcoded method, use vqa().
-11) Be more flexiable about positional understanding. For example, if the query is asking the object at the rightmost position, please check the position with a function, and not naive index-based assumptions.
-12) ESPECIALLY FOR COUNTING, when checking if some objects are inside another object, use the find_overlapping_regions() function to retrieve the region index (can be used with detected_objects[idx]).
-13) When calculating distances between two objects, don't do 2D distance. USE the provided calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) function from the API above.
-14) DetectedObject.description ONLY denotes the type of object - NOT ANY additional relational info (i.e. 'pallet', 'transporter', 'buffer')
+10) Be more flexiable about positional understanding. For example, if the query is asking the object at the rightmost position, please check the position with a function, and not naive index-based assumptions.
+11) ESPECIALLY FOR COUNTING, when checking if some objects are inside another object, use the find_overlapping_regions() function to retrieve the region index (can be used with detected_objects[idx]).
+12) When calculating distances between two objects, don't do 2D distance. USE the provided calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) function from the API above.
+13) DetectedObject.description ONLY denotes the type of object - NOT ANY additional relational info (i.e. 'pallet', 'transporter', 'buffer')
+14) The vqa() function returns a STRING. If you want to parse the output as a boolean or numeric value, for example, please do so appropriately using is_similar_text()
 
 Importantly, new methods MUST start with an underscore. As an example, you may define a "_get_material" method. Please ensure you ALWAYS start the name with an underscore.
 
@@ -43,5 +58,6 @@ DO NOT INCLUDE ``` tags!
 Here is the question:
 {question}
 """
+
 
 

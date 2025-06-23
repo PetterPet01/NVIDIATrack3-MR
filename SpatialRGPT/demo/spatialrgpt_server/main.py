@@ -44,11 +44,12 @@ async def chat_completions(request: ChatCompletionRequest):
                     image_content = item
                     break
         
-        if not image_content:
-            raise HTTPException(status_code=400, detail="No image provided in the last message.")
-
-        pil_image = decode_base64_image(image_content.image_url.url)
-        raw_image_np = np.array(pil_image)
+        # if not image_content:
+        #     raise HTTPException(status_code=400, detail="No image provided in the last message.")
+        raw_image_np = None
+        if image_content is not None:
+            pil_image = decode_base64_image(image_content.image_url.url)
+            raw_image_np = np.array(pil_image)
 
         # --- 2. Prepare Segmentation Masks ---
         seg_masks = []
@@ -73,7 +74,8 @@ async def chat_completions(request: ChatCompletionRequest):
         
         # --- 3. Prepare Depth Map ---
         # The VLM expects a 3-channel image for depth, even if it's grayscale.
-        colorized_depth = np.zeros_like(raw_image_np, dtype=np.uint8)
+        # colorized_depth = np.zeros_like(raw_image_np, dtype=np.uint8)
+        colorized_depth = None
         prompt_str = last_message.content if isinstance(last_message.content, str) else "".join([c.text for c in last_message.content if c.type == 'text'])
 
         # Case A: User provides a depth map

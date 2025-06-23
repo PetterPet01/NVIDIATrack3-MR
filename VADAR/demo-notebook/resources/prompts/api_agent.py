@@ -96,12 +96,12 @@ Here are some helpful instructions:
 7) You may want to extract the 2D bounding boxes from the list of DetectedObject returned by retrieve_objects() before using them in other functions.
 8) When the query asks WHICH object is suitable, ANSWER with DetectedObject.description FOR THE TAG ONLY. The <regionX> tags in DetectedObject.description ALWAYS HAVE the '<' and '>' symbols. Please consider that when writing the code.
 9) The vqa() function returns a STRING. If you want to parse the output as a boolean or numeric value, for example, please do so appropriately using is_similar_text()
-10) DO NOT use simple naive math for moderately complex subtasks for the question. When asking questions that require visual understanding better than naive, unintuitive hardcoded method, use vqa().
-11) ONLY generate executable code, not simply a function definition.
-12) Be more flexiable about positional understanding. For example, if the query is asking the object at the rightmost position, please check the position with a function, and not naive index-based assumptions.
-13) ESPECIALLY FOR COUNTING, when checking if some objects are inside another object, use the find_overlapping_regions() function to retrieve the region index (can be used with detected_objects[idx]).
-14) When calculating distances between two objects, don't do 2D distance. USE the provided calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) function from the API above.
-15) DetectedObject.description ONLY denotes the type of object - NOT ANY additional relational info (i.e. 'pallet', 'transporter', 'buffer')
+10) ONLY generate executable code, not simply a function definition.
+11) Be more flexiable about positional understanding. For example, if the query is asking the object at the rightmost position, please check the position with a function, and not naive index-based assumptions.
+12) ESPECIALLY FOR COUNTING, when checking if some objects are inside another object, use the find_overlapping_regions() function to retrieve the region index (can be used with detected_objects[idx]).
+13) When calculating distances between two objects, don't do 2D distance. USE the provided calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) function from the API above.
+14) DetectedObject.description ONLY denotes the type of object - NOT ANY additional relational info (i.e. 'pallet', 'transporter', 'buffer')
+15) The vqa() function returns a STRING. If you want to parse the output as a boolean or numeric value, for example, please do so appropriately using is_similar_text()
 
 Do not define new methods here, simply solve the problem using the existing methods.
 
@@ -115,4 +115,5 @@ Again, Output the implementation inside <implementation></implementation>.
 <signature>{signature}</signature>
 <question>{question}</question>
 """
+
 

@@ -29,11 +29,6 @@ def run_vlm_inference(
 
     # For now, we assume each call is a new conversation.
     # A more advanced server could manage conversation state with session IDs.
-    conv = conv_templates[request.conv_mode].copy()
-    query = DEFAULT_IMAGE_TOKEN + "\n" + query_base
-    conv.append_message(conv.roles[0], query)
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
 
     # --- Prepare Tensors ---
     device = model.device
@@ -45,11 +40,20 @@ def run_vlm_inference(
     if original_model_dtype != dtype and str(device) != 'cpu':
         model.to(dtype=dtype)
 
-    pil_raw_image = Image.fromarray(raw_image)
-    images_tensor = process_images([pil_raw_image], image_processor, model.config).to(device, dtype=dtype)
+    images_tensor = None
+
+    if raw_image is not None:
+        pil_raw_image = Image.fromarray(raw_image)
+        images_tensor = process_images([pil_raw_image], image_processor, model.config).to(device, dtype=dtype)
     
-    pil_colorized_depth = Image.fromarray(colorized_depth)
-    depths_tensor = process_images([pil_colorized_depth], image_processor, model.config).to(device, dtype=dtype)
+    depths_tensor = None
+
+    if colorized_depth is not None:
+        pil_colorized_depth = Image.fromarray(colorized_depth)
+        depths_tensor = process_images([pil_colorized_depth], image_processor, model.config).to(device, dtype=dtype)
+
+    print(f"Image tensor shape: {images_tensor.shape if images_tensor is not None else 'None'}")
+    print(f"Depth tensor shape: {depths_tensor.shape if depths_tensor is not None else 'None'}")
 
     # --- Mask Processing ---
     current_region_tags = re.findall(r"<region(\d+)>", input_str)
@@ -70,7 +74,30 @@ def run_vlm_inference(
             final_masks_for_model = all_masks_tensor[indices_to_pass]
 
     # --- Run Generation ---
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    conv = conv_templates[request.conv_mode].copy()
+    is_multimodal_request = (raw_image is not None)
+
+    if is_multimodal_request:
+        # --- MULTIMODAL PATH (with image) ---
+        query_base = re.sub(r"<region\d+>", "<mask> <depth>" if use_depth else "<mask>", input_str)
+        query = DEFAULT_IMAGE_TOKEN + "\n" + query_base
+        conv.append_message(conv.roles[0], query)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+        
+        # Use the special tokenizer for the <image> token
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+
+    else:
+        # --- TEXT-ONLY PATH (no image) ---
+        # The prompt is just the user's text. We remove region/depth tags as they are meaningless without an image.
+        text_only_query = re.sub(r"<region\d+>|<depth>|<mask>", "", input_str).strip()
+        conv.append_message(conv.roles[0], text_only_query)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+        
+        # Use the standard, default tokenizer. It knows nothing about image tokens.
+        input_ids = tokenizer([prompt], return_tensors="pt").input_ids.to(device)
 
     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
     stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
@@ -78,8 +105,8 @@ def run_vlm_inference(
     with torch.inference_mode():
         output_ids = model.generate(
             input_ids,
-            images=[images_tensor],
-            depths=[depths_tensor],
+            images=[images_tensor] if images_tensor is not None else None,
+            depths=[depths_tensor] if depths_tensor is not None else None,
             masks=[final_masks_for_model] if final_masks_for_model is not None else None,
             do_sample=True if request.temperature > 0 else False,
             temperature=request.temperature,

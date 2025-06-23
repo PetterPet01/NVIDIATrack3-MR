@@ -164,9 +164,9 @@ class SpatialRGPTClient:
         # Explicitly set use_sam_segmentation, as server defaults to True if not present
         image_options["use_sam_segmentation"] = use_sam_segmentation
 
-        print(f'Size of segmentation masks: {len(segmentation_masks_data)}')
 
         if segmentation_masks_data:
+            print(f'Size of segmentation masks: {len(segmentation_masks_data)}')
             encoded_masks = []
             for mask_obj in segmentation_masks_data:
                 encoded_masks.append(self.encode_mask_to_base64_png(mask_obj)) # Using the new helper
@@ -327,7 +327,7 @@ class SpatialRGPTClient:
             return None
 
 class GeneratorLocal:
-    def __init__(self, model_name="DavidAU/Qwen3-30B-A6B-16-Extreme", temperature=0.7, device_preference=None, max_new_tokens=1024):
+    def __init__(self, model_name="SalonbusAI/GLM-4-32B-0414-FP8", temperature=0.7, device_preference=None, max_new_tokens=1024):
         self.temperature = temperature
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
@@ -429,7 +429,7 @@ class GeneratorLocal:
 from openai import OpenAI
 
 class Generator:
-    def __init__(self, model_name="DavidAU/Qwen3-30B-A6B-16-Extreme", temperature=0.7, base_url=None, api_key="dummy", max_new_tokens=1024):
+    def __init__(self, model_name="SalonbusAI/GLM-4-32B-0414-FP8", base_url=None, api_key="dummy", max_new_tokens=1024):
         """
         Initialize the Generator with OpenAI client
         
@@ -440,7 +440,7 @@ class Generator:
             api_key: API key (can be dummy for local servers)
             max_new_tokens: Maximum tokens to generate
         """
-        self.temperature = temperature
+        # self.temperature = temperature
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         
@@ -466,7 +466,7 @@ class Generator:
         pattern = r'<think>.*?</think>'
         return re.sub(pattern, '', text, flags=re.DOTALL).strip()
 
-    def generate(self, prompt=None, messages=None, enable_thinking=False):
+    def generate(self, prompt=None, messages=None, enable_thinking=False, temperature=0.7):
         """
         Generate text using OpenAI API
         
@@ -489,19 +489,19 @@ class Generator:
             raise ValueError("Either 'prompt' or 'messages' must be provided.")
 
         # Inject `/no_think` if required
-        if not enable_thinking:
-            # Inject into first message if it's user or system
-            first_msg = current_conversation[0]
-            if first_msg["role"] in ("user", "system") and "/no_think" not in first_msg["content"]:
-                first_msg["content"] = "/no_think\n" + first_msg["content"]
+        # if not enable_thinking:
+        #     # Inject into first message if it's user or system
+        #     first_msg = current_conversation[0]
+        #     if first_msg["role"] in ("user", "system") and "/no_think" not in first_msg["content"]:
+        #         first_msg["content"] = "/no_think\n" + first_msg["content"]
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=current_conversation,
-                temperature=self.temperature,
+                temperature=temperature,
                 max_tokens=self.max_new_tokens,
-                top_p=0.9 if self.temperature > 0 else None,
+                top_p=0.9 if temperature > 0 else None,
             )
 
             result = response.choices[0].message.content
@@ -812,7 +812,6 @@ def _instantiate_unik3d_model(model_size_str="Large", device_str="cuda"):
 
 def initialize_modules(
     qwen_model_name="Qwen/Qwen3-8B",
-    qwen_temperature=0.1,
     qwen_max_new_tokens=1536,
     qwen_device_preference=None,
     # SpatialRGPT API parameters
@@ -856,7 +855,6 @@ def initialize_modules(
         # )
         qwen_generator = Generator(
             model_name=qwen_model_name,
-            temperature=qwen_temperature,
             max_new_tokens=qwen_max_new_tokens,
             base_url="http://localhost:8000/v1"
         )
@@ -916,14 +914,14 @@ def correct_indentation(code_str):
     indented_lines = ["    " + line.lstrip() for line in lines]
     return "\n".join(indented_lines)
 
-def generate(prompt: str = None, messages: list = None, enable_thinking=False):
+def generate(prompt: str = None, messages: list = None, enable_thinking=False, temperature=0.2):
     global qwen_generator
     if not qwen_generator:
         error_msg = "Error: Qwen3 Generator not initialized. Call initialize_modules first."
         print(error_msg)
         return error_msg, messages or []
     try:
-        response_text, updated_history = qwen_generator.generate(prompt=prompt, messages=messages, enable_thinking=enable_thinking)
+        response_text, updated_history = qwen_generator.generate(prompt=prompt, messages=messages, enable_thinking=enable_thinking, temperature=temperature)
         return response_text, updated_history
     except Exception as e:
         error_msg = f"Error during qwen_generator.generate() call: {e}"
@@ -1218,7 +1216,7 @@ def enforce_python_code_output(raw_response):
     correction_input = [{"role": "user", "content": correction_prompt}]
 
     try:
-        corrected_output, _ = qwen_generator.generate(messages=correction_input, enable_thinking=False)
+        corrected_output, _ = qwen_generator.generate(messages=correction_input, enable_thinking=False, temperature=0.2)
     except Exception as e:
         print(f"Qwen3 Generator: Error during Python code enforcement: {e}")
         raise
@@ -1316,7 +1314,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # Assuming DetectedObject class is defined as above
 
 # Load a pre-trained embedding model (only once)
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', trust_remote_code=True)
 
 from typing import List
 from sklearn.metrics.pairwise import cosine_similarity
@@ -1332,7 +1330,7 @@ def is_similar_text(text1: str, text2: str) -> bool:
     Returns:
         bool: True if similarity is above threshold, False otherwise.
     """
-    threshold = 0.9
+    threshold = 0.5
     prompt_embedding = embedding_model.encode([text1], convert_to_numpy=True)
     class_embedding = embedding_model.encode([text2], convert_to_numpy=True)
 
@@ -1476,6 +1474,7 @@ def _vqa_predict(img, depth, masks, question):
             rgb_image=img,  # Pass image path to multimodal handler
             depth_image=depth,
             segmentation_masks=masks,
+            temperature=0.2
         )
         
         # Extract answer from response
@@ -1488,17 +1487,21 @@ def _vqa_predict(img, depth, masks, question):
         print(f"Error in VQA prediction: {e}")
         return f"Error: {str(e)}"
 
-def remake_query(query):
+def remake_query(query, tag=''):
     # Generate region IDs based on number of <mask> tokens
     counter = [0]  # Using a list to allow mutation inside replacer
 
     def replacer(match):
-        replacement = f"<region{counter[0]}>"
+        replacement = f"<region{counter[0]}{tag}>"
         counter[0] += 1
         return replacement
 
     query = re.sub(r'<mask>', replacer, query)
     return query
+
+def invert_query(query):
+    # Replace all <regionN> tags with <mask>
+    return re.sub(r'<region\d+>', '<mask>', query)
 
 def vqa(image, depth, question, objects): 
     trace_html = []
@@ -1537,6 +1540,7 @@ def vqa(image, depth, question, objects):
     #         is_holistic = True
     refined_question = remake_query(question)
     trace_html.append(f"<p>VQA Question: {refined_question}</p>")
+    trace_html.append(str([obj.description for obj in objects]))
     print(f"VQA Question: {refined_question}")
     answer = _vqa_predict(image, depth, [det_obj.segmentation_mask_2d for det_obj in objects], refined_question)
     # trace_html.extend(vqa_predict_trace) 
@@ -1646,21 +1650,23 @@ def find_overlapping_regions(parent_region: DetectedObject,
 
 def calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject):
     """
-    Calculates the average bidirectional distance between two 3D objects.
+    Calculates the center-to-center distance between two 3D objects using their oriented bounding boxes.
 
     Args:
-        obj1 (DetectedObject): The first detected object, containing a 3D point cloud.
-        obj2 (DetectedObject): The second detected object, containing a 3D point cloud.
+        obj1 (DetectedObject): The first detected object, containing a 3D oriented bounding box.
+        obj2 (DetectedObject): The second detected object, containing a 3D oriented bounding box.
 
     Returns:
-        float: (meters) distance representing the average of the bidirectional
-            point cloud distances between the two objects.
+        float: (meters) Euclidean distance between the centers of the two objects.
     """
-    dist_pcd1_to_pcd2 = np.asarray(obj1.point_cloud_3d.compute_point_cloud_distance(obj2.point_cloud_3d))
-    dist_pcd2_to_pcd1 = np.asarray(obj2.point_cloud_3d.compute_point_cloud_distance(obj1.point_cloud_3d))
-    combined_distances = np.concatenate((dist_pcd1_to_pcd2, dist_pcd2_to_pcd1))
-    avg_dist = np.mean(combined_distances)
-    return avg_dist
+    # Get the center of each oriented bounding box
+    center1 = obj1.bounding_box_3d_oriented.get_center()
+    center2 = obj2.bounding_box_3d_oriented.get_center()
+    
+    # Calculate Euclidean distance between centers
+    distance = np.linalg.norm(center1 - center2)
+    
+    return distance + distance*0.22
 
 def get_2D_object_size(image, bbox): 
     if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4 and all(isinstance(c, (int, float)) for c in bbox)):
@@ -1910,7 +1916,7 @@ def signature_agent(predef_api, query, vqa_functions):
     prompt = template_prompt.format(signatures=predef_api, question=query, vqa_functions=vqa_functions)
     print("Signature Agent Prompt (first 200 chars):\n", prompt[:200] + "...") 
     console.print(Padding(f"[Signature Agent] Query: {query}", (1, 2), style="on blue"))
-    output_text, _ = generate(prompt=prompt, enable_thinking=False)
+    output_text, _ = generate(prompt=prompt, enable_thinking=False, temperature=0.3)
     
     if not isinstance(output_text, str) or output_text.startswith('Error:'):
         print(f"Signature Agent Error or invalid output: {output_text}")
@@ -1947,132 +1953,158 @@ def expand_template_to_instruction(json_obj):
 
   return "\n".join(instructions)
 
-def query_expansion(query):
+def query_expansion(img, query):
     prompt = """
-# Query Analysis and Visual Verification Task
+# Warehouse Logistics Query Analysis
 
 ## Objective
-Analyze warehouse logistics queries to clarify vague language and provide actionable instructions for spatial understanding.
+Analyze logistics queries to clarify vague language and provide actionable spatial instructions.
 
-## Task Breakdown
+## Process
 
-### Step 1: Query Analysis
-**Goal**: Decode vague superlative words and requests in logistics queries.
+### 1. Query Analysis
+- Identify core request and action needed
+- Define vague terms ("best", "optimal", "suitable") with concrete criteria
+- Clarify spatial relationships
 
-**Process**:
-1. Identify the core request (what action/information is needed)
-2. Define vague terms like "best", "most suitable", "optimal" with concrete criteria
-3. Clarify spatial relationships and constraints
+### 2. Visual Verification (VQA)
+**PURPOSE**: Check ONLY intrinsic object properties visible on the object itself.
 
-### Step 2: Visual Verification Protocol
-**Goal**: Generate VQA calls ONLY to verify simple adjective descriptions that distinguish objects.
+**ALLOWED** (object's own state):
+- Empty/loaded status: "Is this <mask_tag> (transporter) empty?"
+- Physical condition: "Is this <mask_tag> (machine) damaged?" 
+- Operational state: "Is this <mask_tag> (conveyor) running?"
+- Accessibility: "Is this <mask_tag> (path) blocked?"
 
-**PURPOSE**: VQA should only check basic visual properties that help differentiate between similar objects.
+**FORBIDDEN** (requires external context):
+- Spatial relationships: "Is this pallet in the buffer zone?"
+- Comparisons: "Is this the closest/largest/best?"
+- System states: "Is this transporter available/ready?"
+- Distance-based: "Is this near the exit?"
 
-**ALLOWED VQA PATTERNS** (Simple object properties only):
-- Object state: "Is this <mask> (transporter) empty?" (no items on it)
-- Object condition: "Is this <mask> (transporter) damaged?" (visible cracks/dents)
-- Object load status: "Is this <mask> (conveyor) occupied?" (has objects on it)
-- Object operational status: "Is this <mask> (machine) running?" (visible indicators)
+**RULE**: VQA must be answerable by looking only at the cropped object without knowing about other objects, zones, or systems.
 
-**FORBIDDEN VQA PATTERNS** (Too complex or require context):
-- Spatial relationships: "Is this pallet in the buffer zone?" (requires zone context)
-- Relative positions: "Is this the closest pallet?" (requires comparison)
-- System states: "Is this pallet ready for pickup?" (requires system knowledge)
-- Complex assessments: "Is this the best choice?" (requires criteria evaluation)
-- DO NOT propose vqa() checks for PALLETS
-
-**Process**:
-1. **Only extract simple adjectives** that describe basic visual properties
-2. **Focus on distinguishing features** between similar objects
-3. **Ask only about what's visible in the cropped region**
-4. **Avoid complex reasoning or contextual questions**
-
-### Step 3: Spatial Context Instructions
-**Goal**: Provide clear action steps for understanding spatial relationships.
+### 3. Spatial Instructions
+Provide 3-5 clear action steps for spatial logic and decision-making.
 
 ## Examples
 
-### Query: "Given transporter <region0> and <region1>, which is best for pickup?"
-**JSON Output**:
+**Query**: "Which transporter is best for pickup?"
 ```json
 {
-  "explanation": "Best means closest available transporter to minimize travel time",
+  "explanation": "Best means closest available (empty) transporter",
   "visual_checks": [
     {
       "object": "transporter",
       "adjective": "empty",
-      "vqa_call": "vqa(image, depth, 'Is this <mask> (transporter) empty?', detected_objects[0])"
-    },
-    {
-      "object": "transporter",
-      "adjective": "empty",
-      "vqa_call": "vqa(image, depth, 'Is this <mask> (transporter) empty?', detected_objects[1])"
+      "vqa_call": "vqa(image, depth, 'Is this <mask_tag> (transporter) empty?', detected_objects[0])"
     }
   ],
   "spatial_instructions": [
-    "Identify all transporters with empty status",
-    "Calculate distances to pickup location",
+    "Filter transporters by empty status",
+    "Calculate distances to pickup location", 
     "Select closest empty transporter"
   ]
 }
 ```
 
-### Query: "Are there pallets stored in the buffer zone?"
-**JSON Output**:
+**Query**: "Are pallets in the buffer zone?"
 ```json
 {
-  "explanation": "Stored in buffer zone means pallets located within buffer zone boundaries",
+  "explanation": "Pallets located within buffer zone boundaries",
   "visual_checks": [],
   "spatial_instructions": [
-    "Get buffer zone coordinate boundaries",
-    "Check each pallet position against buffer coordinates", 
-    "Count pallets within buffer zone area"
+    "Get buffer zone coordinates",
+    "Check each pallet position against boundaries",
+    "Count pallets within zone"
   ]
 }
 ```
 
 ## Output Format
-
-Generate JSON output in this exact format:
-
 ```json
 {
-  "explanation": "Brief, concrete definition of vague terms and core request",
+  "explanation": "Concrete definition of vague terms (1 sentence max)",
   "visual_checks": [
     {
       "object": "object_name",
-      "adjective": "descriptive_property", 
-      "vqa_call": "vqa(image, depth, 'Is [object] <mask> [adjective]?', [object])"
+      "adjective": "property",
+      "vqa_call": "vqa(image, depth, 'Is this <mask_tag> (object) [property]?', [reference])"
     }
   ],
   "spatial_instructions": [
-    "action_step_1",
-    "action_step_2", 
-    "action_step_3"
+    "Clear action steps for spatial logic (3-5 steps max)"
+  ]
+}
+```
+Input:
+
+"""
+    print(f"Calling SpatialRGPT with query: {query}")
+    output_text, _ = generate_spatial_vlm_response(
+    prompt=prompt + query,
+    # rgb_image=img,
+    temperature=0.1)
+
+    # output_text = generate(prompt=prompt + query, enable_thinking=False, temperature=0.2)[0]
+
+    output_text = output_text.replace("<mask_tag>", "<mask>")
+
+    prompt_json_refine = """
+**Prompt:**
+
+You are a JSON repair assistant. You will be given a possibly malformed or inconsistent JSON object that should match the following structure:
+
+```json
+{
+  "explanation": "string describing the reasoning or criteria",
+  "visual_checks": [
+    {
+      "object": "string (name of object)",
+      "adjective": "string (descriptor like 'empty')",
+      "vqa_call": "string (function call of form: vqa(image, depth, 'Is this <mask> (object) adjective?', [detected_objects[i]]))"
+    },
+    ...
+  ],
+  "spatial_instructions": [
+    "instruction string",
+    ...
   ]
 }
 ```
 
-## Requirements
-- **Explanation**: One sentence maximum, focus on defining "best", "suitable", "optimal" etc.
-- **Visual Checks**: ONLY for simple, distinguishing adjective properties visible in cropped regions
-  - ❌ FORBIDDEN: "Is this pallet stored in the buffer zone?" (requires zone context)
-  - ❌ FORBIDDEN: "Is this the available transporter?" (requires system knowledge)
-  - ❌ FORBIDDEN: "Is this pallet ready for pickup?" (too complex, requires criteria)
-  - ✅ ALLOWED: "Is this transporter empty?" (simple visual state)
-  - ✅ ALLOWED: "Is this transporter damaged?" (visible condition)
-- **Instructions**: 3-5 concise action steps maximum for spatial/complex logic
-- **RULE**: VQA calls should only verify basic adjective properties that distinguish similar objects
+Your task is to:
 
-Input: 
+1. Correct any JSON syntax errors (e.g., commas, brackets, quoting).
+2. Validate and complete all required keys: `explanation`, `visual_checks`, and `spatial_instructions`.
+3. Ensure all `vqa_call` strings follow this template:
+
+   ```
+   vqa(image, depth, 'Is this <region0> (object) adjective?', [detected_objects[i]])
+   ```
+
+   Replace `object`, `adjective`, and `i` with the corresponding values from the JSON entry.
+4. Ensure all <regionX> and <regionX_tag> are replaced with <mask> in the JSON.
+5. Ensure the final output is **valid, parsable JSON** with **no comments**, **no explanation text**, and **nothing outside the JSON** — just the corrected JSON object.
+
+Respond with only the corrected JSON, wrapped inside triple backticks with the `json` tag, like this:
+
+```json
+{
+  ...
+}
+```
+
+Now, here is the input JSON to fix:
+
 """
-    output_text, _ = generate(prompt=prompt + query, enable_thinking=False)
+    output_text_refined = generate(prompt=prompt_json_refine + output_text, enable_thinking=False, temperature=0.2)[0]
+
     print('-Debug-'*20)
-    print(output_text)
+    print(output_text_refined)
     print('-Debug-'*20)
     # More robust regex
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', output_text, re.DOTALL | re.IGNORECASE)
+    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', output_text_refined, re.DOTALL | re.IGNORECASE)
     if match:
         json_str = match.group(1)
         result = json.loads(json_str)
@@ -2175,7 +2207,7 @@ def program_agent(api, query, vqa_functions):
         predef_signatures=MODULES_SIGNATURES, api=api, question=query, vqa_functions=vqa_functions
     )
     
-    output_text, _ = generate(prompt=prompt, enable_thinking=False)
+    output_text, _ = generate(prompt=prompt, enable_thinking=False, temperature=0.3)
 
     if not isinstance(output_text, str) or "Error:" in output_text:
         print(f"Program Agent Error: {output_text}")
@@ -2778,6 +2810,14 @@ def test_individual_api_function(
     _draw.rectangle([10,10,50,50], fill="red")
     _draw.ellipse([70,70,120,120], fill="blue")
 
+    _mock_depth_image_for_test = PILImage.new('L', (MOCK_IMAGE_WIDTH, MOCK_IMAGE_HEIGHT), 128)
+    # Draw depth variations - darker = closer, lighter = farther
+    _draw = ImageDraw.Draw(_mock_depth_image_for_test)
+    _draw.rectangle([10,10,50,50], fill=80)   # Closer object (darker)
+    _draw.ellipse([70,70,120,120], fill=200)  # Farther object (lighter)
+    _draw.rectangle([30,60,80,90], fill=50)   # Closest object (darkest)
+
+
     _obj1_bbox_coords = [10, 10, 50, 50] # Matches red square
     _mock_detected_object_1 = create_mock_detected_object(
         class_name='red_square_mock', description='a mock red square',
@@ -2814,7 +2854,7 @@ def test_individual_api_function(
         # html_trace.extend(html)
         return result
 
-    def _traced_vqa(image, question, bbox):
+    def _traced_vqa(image, depth, question, objects):
         return 'result'
 
     def _traced_get_2D_object_size(image, bbox):
@@ -2884,6 +2924,7 @@ def test_individual_api_function(
         # Mock data to be globally available in the script's context
         # Use generic names like 'image' and 'detected_objects' for common tool parameters
         "image": _mock_image_for_test,
+        "depth":_mock_depth_image_for_test,
         "detected_objects": _mock_detected_objects_list,
 
         # Also provide specific mock variable names if the test call construction uses them
@@ -3197,7 +3238,7 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
         if not current_messages:
             current_messages.append({"role": "user", "content": current_prompt_text})
 
-        output_text, updated_messages = generate(messages=current_messages, enable_thinking=False)
+        output_text, updated_messages = generate(messages=current_messages, enable_thinking=False, temperature=0.3)
         llm_messages_history[current_method_name] = updated_messages
 
         if not isinstance(output_text, str) or "Error:" in output_text:
@@ -3422,7 +3463,7 @@ def main_real():
     dummy_image_path = selected_annotation["image"]
 
     initialize_modules(
-        qwen_model_name="DavidAU/Qwen3-30B-A6B-16-Extreme",
+        qwen_model_name="SalonbusAI/GLM-4-32B-0414-FP8",
         qwen_temperature=0.1,
         qwen_max_new_tokens=4096,
         # internvl_model_name="OpenGVLab/InternVL3-9B",
@@ -3603,8 +3644,7 @@ def initialize_models_and_generator():
 
     # Initialize models
     initialize_modules(
-        qwen_model_name="DavidAU/Qwen3-30B-A6B-16-Extreme",
-        qwen_temperature=0.1,
+        qwen_model_name="SalonbusAI/GLM-4-32B-0414-FP8",
         qwen_max_new_tokens=4096,
         # internvl_model_name="OpenGVLab/InternVL3-9B",
         # internvl_model_revision="7cd614e9f065f6234d57280a1c395008c0b3a996",
@@ -3889,11 +3929,12 @@ def extract_answer_from_result(query: str, result: str):
     if 'yes' in result_lower or 'no' in result_lower:
         prompt = (
             f"Given the question: '{query}' and the answer: '{result}', "
-            f"determine whether the final answer is 'left' or 'right'. "
-            f"Only respond with 'left' or 'right'."
+            "Determine if the correct response is 'left' or 'right'.\n"
+            "Respond with 'left' or 'right' only if the answer is clearly binary (i.e. 'yes' or 'no').\n"
+            "If the answer is ambiguous, not found, or not binary, respond with None."
         )
         try:
-            normalized, _ = generate(prompt=prompt, enable_thinking=False)
+            normalized, _ = generate(prompt=prompt, enable_thinking=False, temperature=0.1)
             normalized = normalized.strip().lower()
             print('-'*20)
             print(normalized)
@@ -3904,6 +3945,9 @@ def extract_answer_from_result(query: str, result: str):
         except Exception as e:
             print(f'An exception ocurred: {e}')
             pass  # Fallback if generation fails
+    
+    if normalized is not None and 'none' in normalized.lower():
+        return None
 
     # If nothing matches
     return None
@@ -3943,13 +3987,17 @@ def process_query(processed_instance_data):
     depth_path = selected_annotation['image'].replace('images', 'depths').replace(image_id, f'{image_id}_depth')
 
     # Set up the test query
-    query_expansion_str = query_expansion(refined_query)
+    query_expansion_str = query_expansion(test_image_pil, remake_query(invert_query(refined_query), '_tag'))
     test_query = refined_query + query_expansion_str + "\nAnswer in either an integer for count, string for region ID ('<regionX>' from detected_object.description), decimal number for distance, or 'left' / 'right' for left-right questions."
     print(f"\nTest Query: {test_query}")
 
     # Display predefined API signatures
     predef_api_signatures = display_predef_api()
     vqa_functions = generate_description_functions(test_query, class_names_list)
+    normalized_result = None
+    html_trace_output= None
+    generated_api_code = None
+    solution_program_code = None
 
     try:
         # Run Signature Agent
@@ -3964,6 +4012,7 @@ def process_query(processed_instance_data):
 
         # Run API Agent
         print("\n--- Running API Agent ---")
+        
         generated_api_code = api_agent(predef_api_signatures, generated_signatures, generated_docstrings, test_query)
         generated_api_code = enforce_python_code_output(generated_api_code)
 
@@ -4002,6 +4051,10 @@ def process_query(processed_instance_data):
             detected_objects_list,
             generated_api_code
         )
+        normalized_result = extract_answer_from_result(refined_query, str(final_result))
+        if normalized_result is None:
+            raise Exception("Answer not found in the result. Please check the query and answer format.")
+
     except Exception as e:
         print(f"Program execution failed: {e}")
         print("Falling back to InternVL3 VQA for an answer.")
@@ -4080,18 +4133,21 @@ def process_query(processed_instance_data):
     full_answer = {
         'final_result': final_result,
         'test_query': test_query,
-        'id': selected_annotation['id'],
+        'id': str(selected_annotation['id']),
         'image_id': image_id,
         'index': index,
         'trace_file_path': os.path.abspath(trace_file_path),
         'summary_file_path': os.path.abspath(summary_file_path),
         'generated_api_code': generated_api_code,
         'solution_program_code': solution_program_code
-    }
+    }    
+
+    if normalized_result is None:
+        normalized_result = extract_answer_from_result(refined_query, str(final_result))
 
     return {
         'id': full_answer['id'],
-        'normalized_answer': extract_answer_from_result(refined_query, str(full_answer['final_result']))
+        'normalized_answer': normalized_result,
     }
     
 def main_processor(processed_instance_data=None):
@@ -4218,23 +4274,23 @@ if __name__ == "__main__":
     # main_combined()
     
     # 2. Batch processing mode (process multiple annotations)
-    # results = main_batch_processing()  # Process annotations at all indices
-    # if results is not None:
-    #     with open("batch_results.json", "w", encoding="utf-8") as f:
-    #         json.dump(results, f, ensure_ascii=False, indent=2)
+    results = main_batch_processing()  # Process annotations at all indices
+    if results is not None:
+        with open("batch_results.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
 
-    #     print("Results saved to batch_results.json")
-    # else:
-    #     print("No results to save.")
+        print("Results saved to batch_results.json")
+    else:
+        print("No results to save.")
 
-    # print(results)
+    print(results)
     
     # 3. Standalone processor (requires processed_instance_data)
     # main_processor(your_processed_instance_data)
     
     # Default: Interactive mode
-    result = main_combined()
-    print(result)
+    # result = main_combined()
+    # print(result)
     # Save to a JSON file if results are not None
 
 
@@ -4392,6 +4448,7 @@ def main():
 
 # if __name__ == "__main__":
 #     main()
+
 
 
 
