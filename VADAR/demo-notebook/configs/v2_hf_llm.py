@@ -40,7 +40,7 @@ dbscan_eps = 0.15
 dbscan_min_points = 15
 spatial_sim_type = "overlap"
 log_dir = "./demo_output_generalized_hf/logs"
-vis = True
+vis = False
 use_clip = False
 perspective_model_variant = "perspective_fields"
 

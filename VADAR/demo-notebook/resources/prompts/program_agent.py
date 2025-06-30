@@ -11,7 +11,7 @@ Solution:
 1) Retrieve all buffer regions: buffers = retrieve_objects(detected_objects, "buffer") (should return region0, region1, region2)
 2) Retrieve all pallets: pallets = retrieve_objects(detected_objects, "pallet") (should return region3-region8)
 3) For all buffers, extract their 3D bounding boxes using extract_3d_bounding_box() and find the rightmost one by comparing x-coordinates of their centers
-4) For all pallets, extract their 3PROGRAM_PROMPTD bounding boxes using extract_3d_bounding_box() and find the leftmost one by comparing x-coordinates of their centers
+4) For all pallets, extract their 3D bounding boxes using extract_3d_bounding_box() and find the leftmost one by comparing x-coordinates of their centers
 5) Calculate 3D distance between the rightmost buffer and leftmost pallet using calculate_3d_distance(rightmost_buffer, leftmost_pallet)
 6) Return the calculated distance in meters
 
@@ -71,7 +71,7 @@ Here are some helpful instructions:
 11) ESPECIALLY FOR COUNTING, when checking if some objects are inside another object, use the find_overlapping_regions() function to retrieve the region index (can be used with detected_objects[idx]).
 12) When calculating distances between two objects, don't do 2D distance. USE the provided calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) function from the API above.
 13) DetectedObject.description ONLY denotes the type of object - NOT ANY additional relational info (i.e. 'pallet', 'transporter', 'buffer')
-14) When calling vqa(image=image, depth=depth, question=question, objects=objects), for each DetectedObject in objects, there must a corresponding <mask> tag in the question.
+14) When calling vqa(image=image, question=question, object=object), for each DetectedObject in objects, there must a corresponding <mask> tag in the question.
 15) The vqa() function returns a STRING. If you want to parse the output as a boolean or numeric value, for example, please do so appropriately using is_similar_text()
 
 Please ensure that you ONLY add new methods when necessary. Do not add new methods if you can solve the problem with combinations of the previous methods!
@@ -80,6 +80,8 @@ Again, answer the question by using the provided API to write a program in the t
 It is critical that the final answer is stored in a GLOBAL variable called "final_result".
 Ensure that the answer is either yes/no, one word, or one number.
 **You MUST generate runnable code, not just a function.**
+**You MUST use 4-space tab indents.**
+**NEVER raise an exception in the code**
 
 AGAIN, answer the question by using the provided API to write a program in the tags <program></program> and ensure the program stores the answer in a variable called "final_result".
 

@@ -40,7 +40,7 @@ Returns:
 </docstring>
 <signature>def is_object_empty(image, depth, detected_object):</signature>
 <implementation>
-is_empty = vqa(image=image, depth=depth, question='Is this object <mask> empty?', objects=[detected_object])
+is_empty = vqa(image=image, question='Is this object <mask> empty?', object=detected_object)
 return is_empty
 </implementation>
 
@@ -82,7 +82,7 @@ Returns:
 <signature>def evaluate_object_relation(image, depth, base_object, relation, target_object):</signature>
 <implementation>
 query = 'Is this object <mask> ' + relation + 'to ' + base_object + '?'
-return vqa(image=image, depth=depth, question=query, objects=[target_object])
+return vqa(image=image, question=query, object=target_object)
 </implementation>
 
 
@@ -105,7 +105,8 @@ Here are some helpful instructions:
 
 Do not define new methods here, simply solve the problem using the existing methods.
 
-Now, given the following docstring and signature, implement the method, using the API specification as necessary. Output the implementation inside <implementation></implementation>.
+Now, given the following docstring and signature, implement the method, using the API specification as necessary. Output the implementation inside <implementation></implementation>. You MUST use 4-space tab indents.
+**NEVER raise an exception in the code**
 
 Again, Output the implementation inside <implementation></implementation>.
 

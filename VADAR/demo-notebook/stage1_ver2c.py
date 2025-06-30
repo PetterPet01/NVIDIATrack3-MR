@@ -1,5 +1,5 @@
+# merged_datagen_module_final_focused.py
 
-# --- CÁC IMPORT GỐC ---
 from langchain_core.output_parsers import JsonOutputParser
 from langchain.prompts import PromptTemplate
 from pydantic import BaseModel, Field
@@ -20,8 +20,7 @@ from mmengine import Config
 import gc
 from datetime import datetime
 import copy
-# --- XÓA IMPORT UNIK3D ---
-# from unik3d.models import UniK3D
+from unik3d.models import UniK3D
 import open3d as o3d
 import random
 import torch
@@ -35,151 +34,9 @@ import io
 import base64
 from pycocotools import mask as mask_util # For RLE decoding
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline # Added pipeline import
+import gc
+from huggingface_hub import hf_hub_download
 
-# Import các wrapper cần thiết cho pipeline mới
-from osdsynth.processor.wrappers.metric3d_v2 import get_depth_model, inference_depth
-from osdsynth.processor.wrappers.perspective_fields import (
-    create_rotation_matrix,
-    get_perspective_fields_model,
-    run_perspective_fields_model,
-)
-
-class PointCloudReconstruction:
-    """Lớp để tái tạo đám mây điểm từ các bản đồ độ sâu. (Code được sao chép từ file thứ 2)"""
-
-    def __init__(self, cfg, logger, device, init_models=True):
-        """Khởi tạo lớp."""
-        self.cfg = cfg
-        self.logger = logger
-        self.device = device
-        self.vis = self.cfg.get('vis', False)
-
-        if init_models:
-            # Khởi tạo perspective_fields_model
-            self.perspective_model_variant = self.cfg.get('perspective_model_variant', 'perspective_fields')
-            if self.perspective_model_variant == "perspective_fields":
-                self.logger.info(f"Using Perspective Fields for camera orientation.")
-                self.perspective_fields_model = get_perspective_fields_model(cfg, device)
-            elif self.perspective_model_variant == "geo_calib":
-                from geocalib import GeoCalib
-                self.logger.info(f"Using GeoCalib for camera orientation.")
-                self.perspective_fields_model = GeoCalib(weights="distorted").to(device)
-            else:
-                raise ValueError(f"perspective_model_variant: {self.perspective_model_variant} not implemented")
-
-            # Khởi tạo Camera Intrinsics Model
-            self.logger.info("Initializing WildCamera for intrinsics.")
-            self.wilde_camera_model = torch.hub.load("ShngJZ/WildCamera", "WildCamera", pretrained=True).to(device)
-
-            # Khởi tạo Metric3D_v2
-            self.logger.info("Initializing Metric3D_v2 for depth estimation.")
-            self.depth_model = get_depth_model(device)
-        else:
-            self.perspective_fields_model = self.wilde_camera_model = self.depth_model = None
-
-    def process(self, filename, image_bgr, detections_list):
-        """Tái tạo đám mây điểm."""
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image_rgb_pil = PILImage.fromarray(image_rgb)
-
-        if self.perspective_model_variant == "perspective_fields":
-            (
-                vis_perspective_fields,
-                perspective_fields,
-            ) = run_perspective_fields_model(self.perspective_fields_model, image_bgr)
-            roll, pitch = perspective_fields["roll"], perspective_fields["pitch"]
-
-        elif self.perspective_model_variant == "geo_calib":
-            from geocalib.utils import rad2deg
-            image_geo = torch.tensor((image_rgb.transpose((2, 0, 1))) / 255.0, dtype=torch.float).to(self.device)
-            geo_results = self.perspective_fields_model.calibrate(image_geo, camera_model="simple_radial")
-            roll, pitch = rad2deg(geo_results["gravity"].rp).unbind(-1)
-            roll, pitch = roll.item(), pitch.item()
-
-        perspective_R = create_rotation_matrix(roll=roll, pitch=pitch, yaw=0, degrees=True)
-        intrinsic, _ = self.wilde_camera_model.inference(image_rgb_pil, wtassumption=False)
-        metric_depth = inference_depth(image_rgb, intrinsic, self.depth_model)
-
-        # Chuyển đổi độ sâu sang điểm 3D
-        cano_pts3d = depth_to_points(metric_depth[None], R=perspective_R.T, intrinsic=intrinsic)
-
-        # Dịch chuyển các điểm xuống mặt đất
-        cano_pts3d_flattened = cano_pts3d.reshape(-1, 3)
-        sorted_flattened_points = cano_pts3d_flattened[cano_pts3d_flattened[:, 2].argsort()]
-        fifty_percent_index = int(sorted_flattened_points.shape[0] * 0.5)
-        selected_nearest_points = sorted_flattened_points[:fifty_percent_index]
-        min_y = np.min(selected_nearest_points[:, 1])
-        cano_pts3d[:, :, 1] -= min_y
-
-        wis3d_instance = None
-        if self.vis:
-            wis3d_instance = Wis3D(self.cfg.wis3d_folder, filename)
-            wis3d_instance.add_point_cloud(
-                vertices=cano_pts3d.reshape((-1, 3)), colors=image_rgb.reshape(-1, 3), name="recons_global_scene_pts"
-            )
-
-        # Tạo điểm cho từng đối tượng
-        for obj_idx in range(len(detections_list)):
-            mask = detections_list[obj_idx]["subtracted_mask"]
-            class_name = detections_list[obj_idx]["class_name"]
-
-            # Trích xuất các điểm 3D của đối tượng bằng mặt nạ 2D
-            object_points = cano_pts3d[mask]
-            if len(object_points) < max(self.cfg.get("min_points_threshold", 10), 5):
-                self.logger.debug(f"Object {class_name} has too few initial points ({len(object_points)}). Skipping.")
-                continue
-
-            object_pcd = o3d.geometry.PointCloud()
-            object_pcd.points = o3d.utility.Vector3dVector(object_points)
-            object_pcd.colors = o3d.utility.Vector3dVector(image_rgb[mask] / 255.0)
-
-            # Xử lý hậu kỳ cho đám mây điểm của đối tượng
-            processed_pcd = process_pcd_for_unik3d(self.cfg, object_pcd) # Tái sử dụng hàm của bạn
-            if len(processed_pcd.points) < self.cfg.get("min_points_threshold_after_denoise", 5):
-                self.logger.debug(f"{class_name} pcd_bbox has too few points after denoise ({len(processed_pcd.points)}). Skipping.")
-                continue
-
-            axis_aligned_bbox, oriented_bbox = get_bounding_box_for_unik3d(self.cfg, processed_pcd)
-            if axis_aligned_bbox.volume() < self.cfg.get("bbox_min_volume_threshold", 1e-7):
-                self.logger.debug(f"{class_name} pcd_bbox has very small volume. Skipping.")
-                continue
-
-            # Thêm dữ liệu 3D vào dictionary
-            detections_list[obj_idx]["pcd"] = processed_pcd
-            detections_list[obj_idx]["axis_aligned_bbox"] = axis_aligned_bbox
-            detections_list[obj_idx]["oriented_bbox"] = oriented_bbox
-
-        # Lọc ra các detection đã được xử lý 3D thành công
-        filtered_detections = [det for det in detections_list if "pcd" in det]
-        return filtered_detections, wis3d_instance
-
-# Các hàm phụ trợ cho PointCloudReconstruction
-def depth_to_points(depth, R=None, t=None, fov=None, intrinsic=None):
-    K = intrinsic
-    Kinv = np.linalg.inv(K)
-    if R is None:
-        R = np.eye(3)
-    if t is None:
-        t = np.zeros(3)
-    M = np.eye(3)
-    height, width = depth.shape[1:3]
-    x = np.arange(width)
-    y = np.arange(height)
-    coord = np.stack(np.meshgrid(x, y), -1)
-    coord = np.concatenate((coord, np.ones_like(coord)[:, :, [0]]), -1)
-    coord = coord.astype(np.float32)[None]
-    D = depth[:, :, :, None, None]
-    pts3D_1 = D * Kinv[None, None, None, ...] @ coord[:, :, :, :, None]
-    pts3D_1 = M[None, None, None, ...] @ pts3D_1
-    pts3D_2 = R[None, None, None, ...] @ pts3D_1 + t[None, None, None, :, None]
-    G = np.eye(3)
-    G[0, 0] = -1.0
-    G[1, 1] = -1.0
-    return pts3D_2[:, :, :, :3, 0][0] @ G.T
-# --- KẾT THÚC PHẦN CODE MỚI ĐƯỢC THÊM VÀO ---
-
-
-# --- Các hàm và lớp gốc được giữ nguyên ---
 def set_all_seeds(seed):
             random.seed(seed)
             np.random.seed(seed)
@@ -190,7 +47,7 @@ def set_all_seeds(seed):
             torch.backends.cudnn.benchmark = False  # Disable benchmark for reproducibility
             set_seed(seed)  # Transformers library seed
 set_all_seeds(42)  # Set a fixed seed for reproducibility
-
+# Simpler logger setup
 def setup_logger_simple(name="sgg_logger", level=None):
     import logging
     logger = logging.getLogger(name)
@@ -198,12 +55,13 @@ def setup_logger_simple(name="sgg_logger", level=None):
         handler = logging.StreamHandler()
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        # logger.addHandler(handler)
     logger.setLevel(logging.INFO if level is None else level)
     return logger
 
 class SkipImageException(Exception): pass
 
+# --- Definition of the DetectedObject class ---
 class DetectedObject:
   def __init__(self,
                class_name: str,
@@ -288,6 +146,19 @@ class DetectedObject:
       image_crop_pil=image_crop
     )
 
+
+    def __repr__(self):
+        num_points = len(self.point_cloud_3d.points) if self.point_cloud_3d and self.point_cloud_3d.has_points() else 0
+        mask_sum_repr = self.segmentation_mask_2d.sum() if self.segmentation_mask_2d is not None else 'None'
+        mask_shape_repr = self.segmentation_mask_2d.shape if self.segmentation_mask_2d is not None else 'N/A'
+        return (f"<DetectedObject: {self.class_name} "
+                f"(Desc: '{self.description[:30]}...'), "
+                f"2D_bbox_orig: {self.bounding_box_2d.tolist() if self.bounding_box_2d is not None else 'N/A'}, "
+                f"Mask_Sum_orig: {mask_sum_repr} (Shape: {mask_shape_repr}), "
+                f"3D_pts: {num_points}, "
+                f"3D_OBB_center: {self.bounding_box_3d_oriented.center.tolist() if self.bounding_box_3d_oriented and not self.bounding_box_3d_oriented.is_empty() else 'N/A'}>")
+
+# --- Helper functions for mask and RLE ---
 def get_bounding_box_from_mask(mask_2d_np: np.ndarray) -> np.ndarray | None:
     if not np.any(mask_2d_np): return None
     rows, cols = np.any(mask_2d_np, axis=1), np.any(mask_2d_np, axis=0)
@@ -299,6 +170,7 @@ def get_bounding_box_from_mask(mask_2d_np: np.ndarray) -> np.ndarray | None:
 def rle_to_mask(rle_obj: dict) -> np.ndarray:
     return mask_util.decode(rle_obj).astype(bool)
 
+# --- LLMClient class for query parsing ---
 class LLMClient:
     def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", logger=None, custom_generate_text=None):
         self.logger = logger or setup_logger_simple("LLMClientQueryParser")
@@ -681,8 +553,7 @@ class LLMClient:
 
         query = re.sub(r'<mask>', replacer, query)
         return query
-# ...
-# Các hàm xử lý Point Cloud cũng được giữ nguyên vì pipeline mới có thể tái sử dụng chúng
+# --- Helper functions for Point Cloud Processing ---
 def process_pcd_for_unik3d(cfg, pcd, run_dbscan=True):
     if not pcd.has_points() or len(pcd.points) == 0: return pcd
     try:
@@ -715,6 +586,7 @@ def get_bounding_box_for_unik3d(cfg, pcd):
     try: oriented_bbox = pcd.get_oriented_bounding_box(robust=cfg.get("obb_robust", True))
     except RuntimeError: oriented_bbox = o3d.geometry.OrientedBoundingBox.create_from_axis_aligned_bounding_box(axis_aligned_bbox)
     return axis_aligned_bbox, oriented_bbox
+
 def axis_aligned_bbox_to_center_euler_extent_for_unik3d(min_coords, max_coords):
     center = tuple((min_val + max_val) / 2.0 for min_val, max_val in zip(min_coords, max_coords))
     extent = tuple(abs(max_val - min_val) for min_val, max_val in zip(min_coords, max_coords))
@@ -723,27 +595,45 @@ def axis_aligned_bbox_to_center_euler_extent_for_unik3d(min_coords, max_coords):
 def oriented_bbox_to_center_euler_extent_for_unik3d(bbox_center, box_R, bbox_extent):
     return np.asarray(bbox_center), Rotation.from_matrix(box_R.copy()).as_euler("XYZ"), np.asarray(bbox_extent)
 
-# def instantiate_model(model_name):
-#     type_ = model_name[0].lower()
-#     name = f"unik3d-vit{type_}"
-#     model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
-#     model.resolution_level = 9
-#     model.interpolation_mode = "bilinear"
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     model = model.to(device).eval()
-#     return model
-# warnings.filterwarnings("ignore")
+# --- UniK3D Model Instantiation ---
+def instantiate_model(model_name):
+    type_ = model_name[0].lower()
+    name = f"unik3d-vit{type_}"
+    model = UniK3D.from_pretrained(f"lpiccinelli/{name}", low_cpu_mem_usage=False)
+    model.resolution_level = 9
+    model.interpolation_mode = "bilinear"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+    return model
+# type_ = model_name[0].lower()
+# name = f"unik3d-vit{type_}"
+# model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
+# model.resolution_level = 9
+# model.interpolation_mode = "bilinear"
+# model = model.to(device).eval()
+    return model
+
+warnings.filterwarnings("ignore")
 
 class GeneralizedSceneGraphGenerator:
     def __init__(self, config_path="config/focused_config.py", device="cuda",
-                 llm_query_parser_model_name_hf="Qwen/Qwen2.5-7B", custom_generate_text = None, test_path=None):
+                 llm_query_parser_model_name_hf="Qwen/Qwen2.5-7B", custom_generate_text = None, test_path=None, unik3d_model=None):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
         self.cfg = Config.fromfile(config_path)
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.logger = setup_logger_simple(name=self.cfg.get("logger_name", "FocusedSGG"))
         self.timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-
+        if unik3d_model is None:
+            try:
+                self.unik3d_model = instantiate_model(self.cfg.get("unik3d_model_size", "Large")) 
+                self.logger.info(f"Successfully initialized UniK3D model ({self.cfg.get('unik3d_model_size', 'Large')})")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize UniK3D model: {e}", exc_info=True)
+                raise RuntimeError("Could not initialize UniK3D model") from e
+        else:
+            self.unik3d_model = unik3d_model
+            
         self.query_parser_llm = None
         _llm_name_to_use = llm_query_parser_model_name_hf or self.cfg.get("llm_model_name_hf")
         if _llm_name_to_use:
@@ -756,14 +646,7 @@ class GeneralizedSceneGraphGenerator:
             raise ValueError("LLM for query parsing is not specified in arguments or config.")
 
 
-        self.reconstructor = None
-        try:
-            # Khởi tạo pipeline tái tạo 3D mới
-            self.reconstructor = PointCloudReconstruction(self.cfg, self.logger, self.device)
-            self.logger.info(f"Successfully initialized PointCloudReconstruction pipeline.")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize PointCloudReconstruction pipeline: {e}", exc_info=True)
-            raise RuntimeError("Could not initialize 3D reconstruction pipeline") from e
+
         
         default_wis3d_folder = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), f"Wis3D_FocusedSGG_{self.timestamp}")
         self.cfg.wis3d_folder = self.cfg.get("wis3d_folder", default_wis3d_folder)
@@ -771,6 +654,30 @@ class GeneralizedSceneGraphGenerator:
         self.cfg.vis = self.cfg.get("vis", False)
     
     
+    def _validate_dimensions(self, image_bgr_processed, points_3d_global, rle_masks_data, llm_parsed_regions):
+        """
+        Comprehensive dimension validation for all input arrays (using processed image dimensions for points_3d_global)
+        """
+        h_proc, w_proc = image_bgr_processed.shape[:2]
+        
+        if points_3d_global.shape[:2] != (h_proc, w_proc):
+            self.logger.error(f"UniK3D output shape {points_3d_global.shape[:2]} doesn't match processed image shape ({h_proc}, {w_proc})")
+            return False
+        
+        for i, rle_obj in enumerate(rle_masks_data):
+            if "size" not in rle_obj:
+                self.logger.error(f"RLE mask {i} missing 'size' field")
+                return False
+            rle_h, rle_w = rle_obj['size']
+            if rle_h <= 0 or rle_w <= 0:
+                self.logger.error(f"RLE mask {i} has invalid dimensions: ({rle_w}, {rle_h})")
+                return False
+        
+        if len(llm_parsed_regions) != len(rle_masks_data):
+            self.logger.error(f"LLM regions count ({len(llm_parsed_regions)}) != RLE masks count ({len(rle_masks_data)})")
+            return False
+        
+        return True
 
     def _validate_mask_dimensions(self, mask, image_shape_processed, mask_index):
         """
@@ -886,6 +793,29 @@ class GeneralizedSceneGraphGenerator:
             self.logger.error(f"Error processing RLE mask {mask_index}: {e}", exc_info=True)
             return None
 
+    def _validate_point_cloud_mask_alignment(self, points_3d_global, mask_2d_processed, obj_index):
+        """
+        Validate that point cloud (global, based on processed image) and mask (processed dimensions) are properly aligned.
+        """
+        if points_3d_global.shape[:2] != mask_2d_processed.shape:
+            self.logger.error(f"Object {obj_index}: Point cloud global shape {points_3d_global.shape[:2]} != processed mask shape {mask_2d_processed.shape}")
+            return False
+        
+        masked_points = points_3d_global[mask_2d_processed]
+        
+        if len(masked_points) == 0:
+            # This warning is now deferred to min_points_threshold check to avoid prematurity
+            # self.logger.warning(f"Object {obj_index}: No points extracted from processed mask")
+            return True # Allow to proceed, might be filtered by point count later
+        
+        if np.all(masked_points == 0):
+            self.logger.warning(f"Object {obj_index}: All extracted points are zero from processed mask")
+        
+        if not np.all(np.isfinite(masked_points)):
+            self.logger.warning(f"Object {obj_index}: Extracted points from processed mask contain non-finite values")
+        
+        return True
+
     def process_and_refine_query(self, data_dict: dict) -> tuple[str, list[DetectedObject]]:
         """
         Complete method that processes JSON data to detect objects and then refines the query
@@ -938,183 +868,204 @@ class GeneralizedSceneGraphGenerator:
         
         return  refined_detected_objects, refined_query
 
-    def process_json_with_llm_classes(self, data_dict: dict) -> tuple[list[DetectedObject], str]:
+    def process_json_with_llm_classes(self, data_dict: dict) -> tuple[list, str]:
         """
-        Xử lý dữ liệu JSON với các lớp từ LLM để phát hiện đối tượng, sử dụng pipeline PointCloudReconstruction.
+        Process JSON data with LLM classes to detect objects.
+        Modified to return both detected objects and the remade query.
+        Includes robust GPU memory management to prevent memory accumulation.
         """
-        self.logger.info("Starting process_json_with_llm_classes using PointCloudReconstruction pipeline...")
-        
-        # 1. KIỂM TRA CÁC THÀNH PHẦN CẦN THIẾT
-        if not self.query_parser_llm:
-            self.logger.error("Query Parser LLM not initialized. Aborting.")
-            return [], ""
-        if not self.reconstructor:
-            self.logger.error("PointCloudReconstruction pipeline not initialized. Aborting.")
-            return [], ""
+        self.logger.info("Starting process_json_with_llm_classes...")
+        if not self.query_parser_llm: 
+            self.logger.error("Query Parser LLM not initialized."); return [], ""
+        if not self.unik3d_model: 
+            self.logger.error("UniK3D model not initialized."); return [], ""
 
-        # 2. TRÍCH XUẤT VÀ KIỂM TRA DỮ LIỆU ĐẦU VÀO
-        image_path = data_dict.get("image")
-        if not image_path:
-            self.logger.error("'image' field (path) missing. Aborting.")
-            return [], ""
+        # Initialize return variables outside the try block
+        detected_object_instances = []
+        remaked_query = ""
 
         try:
-            image_bgr_orig, image_bgr_processed, (w_orig, h_orig) = self._load_image(image_path)
-            h_proc, w_proc = image_bgr_processed.shape[:2]
-            image_rgb_orig = cv2.cvtColor(image_bgr_orig, cv2.COLOR_BGR2RGB)
-            image_pil_orig = PILImage.fromarray(image_rgb_orig)
-        except Exception as e:
-            self.logger.error(f"Failed to load and prepare image {image_path}: {e}", exc_info=True)
-            return [], ""
-
-        conversations = data_dict.get("conversations")
-        if not conversations or not isinstance(conversations, list) or not conversations[0].get("value"):
-            self.logger.error("Invalid 'conversations' structure. Aborting.")
-            return [], ""
-
-        # 3. SỬ DỤNG LLM ĐỂ PHÂN TÍCH TRUY VẤN
-        human_query_full = conversations[0]["value"]
-        human_query_for_llm = human_query_full.split("<image>\n", 1)[-1] if "<image>\n" in human_query_full else human_query_full
-        llm_parsed_regions, remaked_query = self.query_parser_llm.get_class_names_and_regions_from_query(human_query_for_llm)
-        
-        if not llm_parsed_regions:
-            self.logger.error("LLM failed to parse regions or returned no regions. Aborting.")
-            return [], remaked_query
-
-        rle_masks_data = data_dict.get("rle")
-        if not isinstance(rle_masks_data, list) or len(rle_masks_data) != len(llm_parsed_regions):
-            self.logger.error(f"Mismatched or invalid 'rle' field. LLM regions: {len(llm_parsed_regions)}, RLEs: {len(rle_masks_data) if rle_masks_data else 0}. Aborting.")
-            return [], remaked_query
-
-        # 4. CHUẨN BỊ ĐẦU VÀO CHO PIPELINE TÁI TẠO 3D
-        # Tạo một danh sách các đối tượng cần xử lý, bao gồm cả mặt nạ đã được giải mã.
-        initial_detections_list = []
-        for i in range(len(llm_parsed_regions)):
-            rle_obj = rle_masks_data[i]
+            image_path = data_dict.get("image")
+            if not image_path: 
+                self.logger.error("'image' field (path) missing."); return [], ""
             
-            # Giải mã RLE để có mask ở kích thước đã xử lý (h_proc, w_proc)
-            mask_processed = self._process_rle_mask_with_coordinate_validation(rle_obj, h_proc, w_proc, i)
+            try:
+                image_bgr_orig, image_bgr_processed, (w_orig, h_orig) = self._load_image(image_path)
+                h_proc, w_proc = image_bgr_processed.shape[:2]
+
+                image_rgb_orig = cv2.cvtColor(image_bgr_orig, cv2.COLOR_BGR2RGB)
+                image_pil_orig = PILImage.fromarray(image_rgb_orig) # For final cropping in original dimensions
+
+                image_rgb_processed = cv2.cvtColor(image_bgr_processed, cv2.COLOR_BGR2RGB) # For UniK3D and point colors
+            except Exception as e:
+                self.logger.error(f"Failed to load and prepare image {image_path}: {e}", exc_info=True); return [], ""
+
+            conversations = data_dict.get("conversations")
+            if not conversations or not isinstance(conversations, list) or not conversations[0].get("value"):
+                self.logger.error("Invalid 'conversations' structure."); return [], ""
             
-            # Chỉ xử lý những mask hợp lệ và không rỗng
-            if mask_processed is None or not np.any(mask_processed):
-                self.logger.warning(f"Skipping empty or invalid mask for region {i} ({llm_parsed_regions[i]['description']}).")
-                continue
+            human_query_full = conversations[0]["value"]
+            human_query_for_llm = human_query_full.split("<image>\n", 1)[-1] if "<image>\n" in human_query_full else human_query_full
+
+            llm_parsed_regions, remaked_query = self.query_parser_llm.get_class_names_and_regions_from_query(human_query_for_llm)
+            if not llm_parsed_regions: 
+                self.logger.error("LLM failed to parse regions or returned no regions."); return [], remaked_query
             
-            # Gói dữ liệu vào cấu trúc mà reconstructor.process mong đợi
-            initial_detections_list.append({
-                "class_name": llm_parsed_regions[i]["class_name"],
-                "description": llm_parsed_regions[i]["region_id"],
-                "original_rle": rle_obj.get("counts"),
-                "subtracted_mask": mask_processed,
-                # Thêm index gốc để dễ dàng truy xuất lại
-                "original_index": i 
-            })
+            rle_masks_data = data_dict.get("rle")
+            if not isinstance(rle_masks_data, list): 
+                self.logger.error("Missing or invalid 'rle' field."); return [], remaked_query
 
-        if not initial_detections_list:
-            self.logger.error("No valid masks to process for 3D reconstruction. Aborting.")
-            return [], remaked_query
-
-        # 5. GỌI PIPELINE TÁI TẠO 3D
-        filename_prefix = data_dict.get("id", "scene")
-        # Sử dụng ảnh BGR đã xử lý làm đầu vào
-        reconstructor_outputs, wis3d_instance = self.reconstructor.process(
-            filename=filename_prefix,
-            image_bgr=image_bgr_processed,
-            detections_list=initial_detections_list # Danh sách này đã chứa các mặt nạ
-        )
-
-        if not reconstructor_outputs:
-            self.logger.warning("3D reconstruction pipeline returned no valid objects.")
-            return [], remaked_query
-
-        # 6. XỬ LÝ ĐẦU RA VÀ TẠO CÁC ĐỐI TƯỢNG `DetectedObject`
-        detected_object_instances = []
-        for i, detection_data in enumerate(reconstructor_outputs):
-            # Dữ liệu 3D đã được xử lý sẵn từ pipeline
-            processed_pcd = detection_data["pcd"]
-            aabb_3d = detection_data["axis_aligned_bbox"]
-            obb_3d = detection_data["oriented_bbox"]
+            # --- Major GPU Memory Allocation Point ---
+            image_tensor = torch.from_numpy(image_rgb_processed).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+            with torch.no_grad():
+                outputs = self.unik3d_model.infer(image_tensor, camera=None, normalize=True)
             
-            # Thông tin gốc của đối tượng
-            class_name = detection_data["class_name"]
-            description = detection_data["description"]
-            rle_str = detection_data["original_rle"]
-            mask_2d_processed_dims = detection_data["subtracted_mask"]
-
-            # Chuyển đổi các thuộc tính 2D về kích thước ảnh gốc
-            mask_2d_orig_dims = cv2.resize(
-                mask_2d_processed_dims.astype(np.uint8),
-                (w_orig, h_orig), # scale về (rộng_gốc, cao_gốc)
-                interpolation=cv2.INTER_NEAREST
-            ).astype(bool)
-
-            bbox_2d_np_proc = get_bounding_box_from_mask(mask_2d_processed_dims)
-            bbox_2d_np_orig = None
-            image_crop_pil_orig = None
-            if bbox_2d_np_proc is not None:
-                scale_x = w_orig / w_proc
-                scale_y = h_orig / h_proc
-                x1_orig = int(round(bbox_2d_np_proc[0] * scale_x))
-                y1_orig = int(round(bbox_2d_np_proc[1] * scale_y))
-                x2_orig = int(round(bbox_2d_np_proc[2] * scale_x))
-                y2_orig = int(round(bbox_2d_np_proc[3] * scale_y))
-                bbox_2d_np_orig = np.array([x1_orig, y1_orig, x2_orig, y2_orig])
-
-                try:
-                    # Đảm bảo tọa độ crop hợp lệ
-                    x1_c, y1_c = max(0, x1_orig), max(0, y1_orig)
-                    x2_c, y2_c = min(w_orig, x2_orig), min(h_orig, y2_orig)
-                    if (x2_c - x1_c > 0) and (y2_c - y1_c > 0):
-                        image_crop_pil_orig = image_pil_orig.crop((x1_c, y1_c, x2_c, y2_c))
-                except Exception as e_crop:
-                    self.logger.warning(f"Crop error on original image for {description}: {e_crop}")
+            # --- Immediately move data to CPU and free up GPU tensor references ---
+            points_3d_global = outputs["points"].squeeze().permute(1, 2, 0).cpu().numpy() # Shape (h_proc, w_proc, 3)
             
-            # Tạo đối tượng DetectedObject cuối cùng
-            det_obj = DetectedObject(
-                class_name=class_name, 
-                description=description, 
-                segmentation_mask_2d=mask_2d_orig_dims,
-                rle_mask_2d=rle_str,
-                bounding_box_2d=bbox_2d_np_orig,
-                point_cloud_3d=processed_pcd,
-                bounding_box_3d_oriented=obb_3d,
-                bounding_box_3d_axis_aligned=aabb_3d,
-                image_crop_pil=image_crop_pil_orig
-            )
-            detected_object_instances.append(det_obj)
-            self.logger.info(f"Successfully created DetectedObject for {description} ({class_name}) from pipeline.")
+            # Explicitly delete the large GPU tensors. This signals to Python's garbage
+            # collector that the memory can be marked for reuse.
+            del outputs
+            del image_tensor
+            # --- End of primary GPU operations ---
+            
+            if not self._validate_dimensions(image_bgr_processed, points_3d_global, rle_masks_data, llm_parsed_regions):
+                self.logger.error("Dimension validation failed - aborting processing")
+                return [], remaked_query
+            
+            min_initial_pts = self.cfg.get("min_points_threshold", 10)
+            min_processed_pts = self.cfg.get("min_points_threshold_after_denoise", 5)
+            min_bbox_volume = self.cfg.get("bbox_min_volume_threshold", 1e-7)
 
-            # Thêm vào Wis3D để visualize (nếu được bật)
-            if wis3d_instance and processed_pcd.has_points():
-                cmap = matplotlib.colormaps.get_cmap("turbo")
-                color_idx = detection_data.get("original_index", i) # Dùng index gốc để màu sắc ổn định
-                instance_color = np.array(cmap(color_idx / max(1, len(llm_parsed_regions) - 1))[:3])
+            wis3d_instance = None
+            if self.cfg.get("vis", False):
+                filename_prefix = data_dict.get("id", "scene") + "_" + self.timestamp
+                wis3d_instance = Wis3D(self.cfg.wis3d_folder, filename_prefix)
+                if points_3d_global.shape[:2] == image_rgb_processed.shape[:2]:
+                    global_vertices = points_3d_global.reshape((-1, 3))
+                    global_colors_uint8 = image_rgb_processed.reshape(-1, 3)
+                    if len(global_vertices) > 0:
+                        wis3d_instance.add_point_cloud(
+                            vertices=global_vertices, colors=global_colors_uint8, 
+                            name="unik3d_global_scene_pts_processed_dims"
+                        )
+
+            for i in range(len(llm_parsed_regions)):
+                llm_region_info = llm_parsed_regions[i]
+                rle_obj = rle_masks_data[i]
+                rle_str = rle_obj.get("counts", None)
+                class_name = llm_region_info["class_name"]
+                description = llm_region_info["region_id"]
                 
-                pcd_to_vis = o3d.geometry.PointCloud(processed_pcd)
-                pcd_to_vis.paint_uniform_color(instance_color)
+                mask_2d_processed_dims = self._process_rle_mask_with_coordinate_validation(rle_obj, h_proc, w_proc, i)
+                if mask_2d_processed_dims is None:
+                    self.logger.error(f"Failed to process RLE mask for {description} (idx {i})"); continue
                 
-                wis3d_instance.add_point_cloud(
-                    vertices=np.asarray(pcd_to_vis.points), 
-                    colors=(np.asarray(pcd_to_vis.colors) * 255).astype(np.uint8),
-                    name=f"{i:02d}_{class_name}_reg_{description}_3Dpts"
+                if not self._validate_mask_dimensions(mask_2d_processed_dims, image_bgr_processed.shape, i):
+                    self.logger.warning(f"Processed mask validation failed for {description} (idx {i})"); continue
+                
+                if not self._validate_point_cloud_mask_alignment(points_3d_global, mask_2d_processed_dims, i):
+                    self.logger.error(f"Point cloud and processed mask alignment failed for {description} (idx {i})"); continue
+
+                mask_2d_orig_dims = cv2.resize(mask_2d_processed_dims.astype(np.uint8), (w_orig, h_orig), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                bbox_2d_np_proc = get_bounding_box_from_mask(mask_2d_processed_dims)
+                bbox_2d_np_orig, image_crop_pil_orig = None, None
+
+                if bbox_2d_np_proc is not None:
+                    if w_proc > 0 and h_proc > 0:
+                        scale_x, scale_y = w_orig / w_proc, h_orig / h_proc
+                        x1_orig, y1_orig = int(round(bbox_2d_np_proc[0] * scale_x)), int(round(bbox_2d_np_proc[1] * scale_y))
+                        x2_orig, y2_orig = int(round(bbox_2d_np_proc[2] * scale_x)), int(round(bbox_2d_np_proc[3] * scale_y))
+                        bbox_2d_np_orig = np.array([x1_orig, y1_orig, x2_orig, y2_orig])
+                    
+                        try:
+                            x1_c, y1_c = max(0, x1_orig), max(0, y1_orig)
+                            x2_c, y2_c = min(w_orig, x2_orig), min(h_orig, y2_orig)
+                            if x2_c > x1_c and y2_c > y1_c:
+                                image_crop_pil_orig = image_pil_orig.crop((x1_c, y1_c, x2_c, y2_c))
+                            else: self.logger.warning(f"Invalid crop dimensions for {description} (idx {i})")
+                        except Exception as e_crop:
+                            self.logger.warning(f"Crop error on original image for {description} (idx {i}): {e_crop}")
+                    else:
+                        self.logger.error(f"Processed image dimensions are zero for {description}, cannot scale bbox.")
+                else:
+                    self.logger.warning(f"No 2D bbox from processed mask for {description} (idx {i}).")
+
+                obj_points = points_3d_global[mask_2d_processed_dims]
+                if len(obj_points) < min_initial_pts: 
+                    self.logger.debug(f"Too few initial points ({len(obj_points)}) for {description} (idx {i})."); continue
+                
+                pcd_obj = o3d.geometry.PointCloud()
+                pcd_obj.points = o3d.utility.Vector3dVector(obj_points)
+                obj_colors_rgb_0_255 = image_rgb_processed[mask_2d_processed_dims] 
+                if len(obj_colors_rgb_0_255) == len(obj_points): 
+                    pcd_obj.colors = o3d.utility.Vector3dVector(obj_colors_rgb_0_255 / 255.0)
+                
+                processed_pcd = process_pcd_for_unik3d(self.cfg, pcd_obj)
+
+                if not processed_pcd.has_points() or len(processed_pcd.points) < min_processed_pts:
+                    self.logger.debug(f"Too few processed points for {description} (idx {i})."); continue
+                
+                aabb_3d, obb_3d = get_bounding_box_for_unik3d(self.cfg, processed_pcd)
+                if aabb_3d.is_empty() or aabb_3d.volume() < min_bbox_volume:
+                    self.logger.debug(f"Small/empty 3D bbox for {description} (idx {i})."); continue
+                
+                det_obj = DetectedObject(
+                    class_name, description, mask_2d_orig_dims, rle_str,
+                    bbox_2d_np_orig, processed_pcd, obb_3d, aabb_3d, image_crop_pil_orig
                 )
-                # ... (phần visualize bbox giữ nguyên)
-                aa_center,_,aa_extent = axis_aligned_bbox_to_center_euler_extent_for_unik3d(aabb_3d.get_min_bound(), aabb_3d.get_max_bound())
-                wis3d_instance.add_boxes(positions=np.array([aa_center]), eulers=np.array([(0,0,0)]), extents=np.array([aa_extent]), name=f"{i:02d}_{class_name}_aa_bbox3D")
-                if not obb_3d.is_empty():
-                    or_center,or_eulers,or_extent = oriented_bbox_to_center_euler_extent_for_unik3d(obb_3d.center, obb_3d.R, obb_3d.extent)
-                    wis3d_instance.add_boxes(positions=np.array([or_center]), eulers=np.array([or_eulers]), extents=np.array([or_extent]), name=f"{i:02d}_{class_name}_or_bbox3D")
+                detected_object_instances.append(det_obj)
+                self.logger.info(f"Created DetectedObject for {description} ({class_name}) (idx {i}).")
 
+                if wis3d_instance and processed_pcd.has_points():
+                    cmap = matplotlib.colormaps.get_cmap("turbo")
+                    color_val = i / max(1, len(llm_parsed_regions) - 1)
+                    instance_color = np.array(cmap(color_val)[:3])
+                    
+                    pcd_to_vis = o3d.geometry.PointCloud(processed_pcd).paint_uniform_color(instance_color)
+                    wis3d_instance.add_point_cloud(
+                        vertices=np.asarray(pcd_to_vis.points), 
+                        colors=(np.asarray(pcd_to_vis.colors) * 255).astype(np.uint8), 
+                        name=f"{i:02d}_{class_name}_reg_{description}_3Dpts"
+                    )
+                    
+                    aa_center,_,aa_extent = axis_aligned_bbox_to_center_euler_extent_for_unik3d(aabb_3d.get_min_bound(), aabb_3d.get_max_bound())
+                    wis3d_instance.add_boxes(positions=np.array([aa_center]), eulers=np.zeros((1,3)), extents=np.array([aa_extent]), name=f"{i:02d}_{class_name}_aa_bbox3D")
+                    
+                    if not obb_3d.is_empty() and np.all(np.array(obb_3d.extent) > 1e-6):
+                        or_center, or_eulers, or_extent = oriented_bbox_to_center_euler_extent_for_unik3d(obb_3d.center, obb_3d.R, obb_3d.extent)
+                        wis3d_instance.add_boxes(positions=np.array([or_center]), eulers=np.array([or_eulers]), extents=np.array([or_extent]), name=f"{i:02d}_{class_name}_or_bbox3D")
+            
+            self.logger.info(f"Finished processing. Generated {len(detected_object_instances)} objects.")
+            
+            if detected_object_instances:
+                vis_save_path = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), 
+                                            f"mask_visualization_{data_dict.get('id', 'scene')}_{self.timestamp}.jpg")
+                self.visualize_all_masks_on_original(image_bgr_orig, detected_object_instances, vis_save_path)
 
-        self.logger.info(f"Reconstruction finished. Generated {len(detected_object_instances)} objects.")
-        
-        # 7. VISUALIZE KẾT QUẢ CUỐI CÙNG
-        if detected_object_instances:
-            vis_save_path = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), f"mask_visualization_{data_dict.get('id', 'scene')}_{self.timestamp}.jpg")
-            self.visualize_all_masks_on_original(image_bgr_orig, detected_object_instances, vis_save_path)
+            return detected_object_instances, remaked_query
 
-        return detected_object_instances, remaked_query
+        finally:
+            # --- GPU MEMORY CLEANUP ---
+            # This block will always execute, whether the 'try' block completes
+            # successfully or raises an exception, ensuring no memory leaks.
+            
+            # 1. Manually trigger Python's garbage collector. This helps ensure that
+            #    the 'del' statements above have taken effect and Python no longer
+            #    holds references to the GPU tensors.
+            gc.collect()
 
+            # 2. Tell PyTorch to release all "cached" memory that is not currently
+            #    in use. This is the main step that returns memory to the OS/driver.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                self.logger.debug(
+                    f"GPU cache cleared. "
+                    f"Memory Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB. "
+                    f"Memory Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB."
+                )
+                 
     def merge_regions_with_identical_masks(self, detected_objects: list[DetectedObject], query: str) -> tuple[str, list[DetectedObject]]:
         """
         Merge regions with identical RLE masks and use LLM to refine the query.
@@ -1303,19 +1254,15 @@ class GeneralizedSceneGraphGenerator:
             self.query_parser_llm = None 
             self.logger.info("Query Parser LLM client instance and its pipeline marked for release.")
 
-        if hasattr(self, 'reconstructor') and self.reconstructor is not None:
-        # Xóa các model con để giải phóng bộ nhớ GPU
-            if hasattr(self.reconstructor, 'perspective_fields_model'):
-                del self.reconstructor.perspective_fields_model
-            if hasattr(self.reconstructor, 'wilde_camera_model'):
-                del self.reconstructor.wilde_camera_model
-            if hasattr(self.reconstructor, 'depth_model'):
-                del self.reconstructor.depth_model
-            
-            # Xóa đối tượng reconstructor chính
-            del self.reconstructor
-            self.reconstructor = None
-            self.logger.info("PointCloudReconstruction pipeline and its models released.")
+        if hasattr(self, 'unik3d_model') and self.unik3d_model is not None:
+            try:
+                if hasattr(self.unik3d_model, 'device') and self.unik3d_model.device.type == 'cuda': 
+                    self.unik3d_model.cpu()
+            except Exception as e:
+                self.logger.warning(f"Could not move UniK3D model to CPU: {e}")
+            del self.unik3d_model
+            self.unik3d_model = None
+            self.logger.info("UniK3D model resources released.")
         
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
@@ -1384,14 +1331,12 @@ class GeneralizedSceneGraphGenerator:
             return 1
         else:
             return 0
-        
-# --- Cập nhật phần cấu hình mặc định ---
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     CONFIG_DIR = "configs"
     CONFIG_FILE_NAME = "v2_hf_llm.py" 
     
-    DEFAULT_GENERATOR_CONFIG = "config/focused_config.py"
+    DEFAULT_GENERATOR_CONFIG = "configs/v2_hf_llm.py"
     if os.path.exists(DEFAULT_GENERATOR_CONFIG):
         CONFIG_FILE_PATH = DEFAULT_GENERATOR_CONFIG
         CONFIG_DIR = os.path.dirname(CONFIG_FILE_PATH) 
@@ -1404,35 +1349,63 @@ if __name__ == "__main__":
 
 
     if not os.path.exists(CONFIG_DIR): os.makedirs(CONFIG_DIR)
-    # Cập nhật nội dung file config mặc định để bao gồm các tham số mới
     if not os.path.exists(CONFIG_FILE_PATH):
         with open(CONFIG_FILE_PATH, "w") as f:
             f.write(f"""
-# Config cho focused_datagen_module.py ({CONFIG_FILE_NAME})
-# Cấu hình LLM
-llm_model_name_hf = "Qwen/Qwen2.5-7B-Instruct"
+Class related params
+class_set = "ram"
+add_bg_classes = False
+accumu_classes = False
+exp_suffix = None
+rm_bg_classes = True
+add_classes = []
+remove_classes = [
+    "room", "kitchen", "office", "house", "home", "building", "corner", "shadow", "carpet", "photo", "sea", "shade", "stall", "space", "aquarium", "apartment", "image", "city", "blue", "skylight", "hallway", "bureau", "modern", "salon", "doorway", "wall lamp", "scene", "sun", "sky", "smile", "cloudy", "comfort", "white", "black", "red", "green", "yellow", "purple", "pink", "stand", "wear", "area", "shine", "lay", "walk", "lead", "bite", "sing",
+]
+bg_classes = ["wall", "floor", "ceiling"]
+sam_variant = "sam-hq"
+specified_tags = "None"
+box_threshold = 0.25
+text_threshold = 0.2
+nms_threshold = 0.5
+masking_option = "none"
+mask_area_threshold = 100
+mask_conf_threshold = 0.3
+max_bbox_area_ratio = 0.90
+skip_bg = False
 
-# Cấu hình Pipeline tái tạo 3D
-perspective_model_variant = "perspective_fields" # hoặc "geo_calib"
-# Đường dẫn đến các trọng số model, cần tải về và đặt vào thư mục phù hợp
-# ví dụ: perspective_model_path = "/root/VADAR/demo-notebook/osdsynth/external/PerspectiveFields"
+# Depth model configuration
+model_name = "Large"# Only use unik3d for depth estimation
 
-# Cấu hình chung
-logger_name = "FocusedSGGTest"
-log_dir = "./temp_outputs/logs_focused"
-wis3d_folder = "./temp_outputs/wis3d_focused"
+# Point cloud processing params
+min_points_threshold = 50
+min_points_threshold_after_denoise = 25
+bbox_min_volume_threshold = 1e-6 # Minimum volume for a bounding box to be considered valid
+pcd_perturb_std = 0.001 # Standard deviation for random perturbation of points
+
+pcd_sor_neighbors = 20 # Statistical Outlier Removal: number of neighbors
+pcd_sor_std_ratio = 1.5 # Statistical Outlier Removal: std ratio
+pcd_voxel_size = 0.01   # Voxel size for downsampling (e.g., 1cm). Set to 0 to disable.
+obb_robust = True # Use robust OBB calculation in Open3D
+
+downsample_voxel_size = 0.02
+dbscan_remove_noise = True
+dbscan_eps = 0.15
+dbscan_min_points = 15
+spatial_sim_type = "overlap"
+log_dir = "./demo_output_generalized_hf/logs"
 vis = True
-image_resize_height = 0 # pipeline này thường hoạt động tốt với kích thước cố định
+use_clip = False
+perspective_model_variant = "perspective_fields"
 
-# Cấu hình xử lý Point Cloud
-pcd_sor_neighbors = 20; pcd_sor_std_ratio = 1.5; pcd_voxel_size = 0.01
-dbscan_remove_noise = True; dbscan_eps = 0.05; dbscan_min_points = 10
-obb_robust = True
-min_points_threshold = 10
-min_points_threshold_after_denoise = 5
-bbox_min_volume_threshold = 1e-7
-""")
-        print(f"Created dummy config with new parameters: {CONFIG_FILE_PATH}")
+# LLM related (Hugging Face)
+# llm_model_name_hf = "Qwen/Qwen2.5-1.5B" # Smaller model for quick testing, e.g., Qwen/Qwen2-0.5B-Instruct or Qwen/Qwen2-1.5B-Instruct
+llm_model_name_hf = "Qwen/Qwen2.5-7B-Instruct" # Larger model, requires more resources & HF_TOKEN
+llm_max_retries = 2
+llm_temperature = 0.1
+llm_max_new_tokens = 1024 * 10 # Reduced for smaller models, adjust as needed
+    """)
+        print(f"Created dummy config: {CONFIG_FILE_PATH}")
 
     sample_data_dict_from_user = {
         "id": "e6f08787cba0eb0e6f5386a81016cb94",
@@ -1513,7 +1486,7 @@ bbox_min_volume_threshold = 1e-7
         os.makedirs(DEMO_IMAGE_DIR)
     
     image_filename = sample_data_dict_from_user["image"]
-    TARGET_IMAGE_PATH = '/root/VADAR/demo-notebook/054690.png'
+    TARGET_IMAGE_PATH = '/root/Hachiman/SpatialRGPT/dataset_pipeline/054690.png'
 
     if not os.path.exists(TARGET_IMAGE_PATH):
         # RLE size is [height, width]
@@ -1574,3 +1547,8 @@ bbox_min_volume_threshold = 1e-7
         if generator:
             del generator 
         main_logger.info("\nTest run complete. Check logs and temp_outputs_focused directory.")
+
+
+
+
+
