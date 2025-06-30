@@ -40,4 +40,4 @@ pip install openai
 pip install sentence_transformers
 pip install spacy wordfreq "numpy<1.28.0,>=1.21.6"
 python -m spacy download en_core_web_sm
-
+pip install IPython pandas autopep8
