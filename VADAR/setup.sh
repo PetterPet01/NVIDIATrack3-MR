@@ -11,7 +11,7 @@ pip install "numpy<2"
 apt-get install python3.10-dev -y
 # pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 xformers==0.0.29.post3 --extra-index-url https://download.pytorch.org/whl/cu126 --force-reinstall
 
-git clone https://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@github.com/PetterPet01/UniK3D-demo.git
+git clone https://github.com/PetterPet01/UniK3D-demo.git
 cd UniK3D-demo
 
 pip install -e . --extra-index-url https://download.pytorch.org/whl/cu121
