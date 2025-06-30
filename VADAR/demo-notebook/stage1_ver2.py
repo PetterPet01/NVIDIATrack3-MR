@@ -24,8 +24,6 @@ from unik3d.models import UniK3D
 import open3d as o3d
 import random
 import torch
-from transformers import set_seed
-import random
 from wis3d import Wis3D # For visualization
 import matplotlib # For coloring instances in Wis3D
 from scipy.spatial.transform import Rotation # For OBB to Euler
@@ -34,6 +32,12 @@ import io
 import base64
 from pycocotools import mask as mask_util # For RLE decoding
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline # Added pipeline import
+import gc
+from huggingface_hub import hf_hub_download
+
+
+import random
+from transformers import set_seed
 def set_all_seeds(seed):
             random.seed(seed)
             np.random.seed(seed)
@@ -52,7 +56,7 @@ def setup_logger_simple(name="sgg_logger", level=None):
         handler = logging.StreamHandler()
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        # logger.addHandler(handler)
     logger.setLevel(logging.INFO if level is None else level)
     return logger
 
@@ -596,7 +600,7 @@ def oriented_bbox_to_center_euler_extent_for_unik3d(bbox_center, box_R, bbox_ext
 def instantiate_model(model_name):
     type_ = model_name[0].lower()
     name = f"unik3d-vit{type_}"
-    model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
+    model = UniK3D.from_pretrained(f"lpiccinelli/{name}", low_cpu_mem_usage=False)
     model.resolution_level = 9
     model.interpolation_mode = "bilinear"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -607,7 +611,7 @@ warnings.filterwarnings("ignore")
 
 class GeneralizedSceneGraphGenerator:
     def __init__(self, config_path="config/focused_config.py", device="cuda",
-                 llm_query_parser_model_name_hf="Qwen/Qwen2.5-7B", custom_generate_text = None, test_path=None):
+                 llm_query_parser_model_name_hf="Qwen/Qwen2.5-7B", custom_generate_text = None, test_path=None, unik3d_model=None):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
         self.cfg = Config.fromfile(config_path)
@@ -627,12 +631,15 @@ class GeneralizedSceneGraphGenerator:
             raise ValueError("LLM for query parsing is not specified in arguments or config.")
 
 
-        try:
-            self.unik3d_model = instantiate_model(self.cfg.get("unik3d_model_size", "Large")) 
-            self.logger.info(f"Successfully initialized UniK3D model ({self.cfg.get('unik3d_model_size', 'Large')})")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize UniK3D model: {e}", exc_info=True)
-            raise RuntimeError("Could not initialize UniK3D model") from e
+        if unik3d_model is None:
+            try:
+                self.unik3d_model = instantiate_model(self.cfg.get("unik3d_model_size", "Large")) 
+                self.logger.info(f"Successfully initialized UniK3D model ({self.cfg.get('unik3d_model_size', 'Large')})")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize UniK3D model: {e}", exc_info=True)
+                raise RuntimeError("Could not initialize UniK3D model") from e
+        else:
+            self.unik3d_model = unik3d_model
         
         default_wis3d_folder = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), f"Wis3D_FocusedSGG_{self.timestamp}")
         self.cfg.wis3d_folder = self.cfg.get("wis3d_folder", default_wis3d_folder)
@@ -854,217 +861,204 @@ class GeneralizedSceneGraphGenerator:
         
         return  refined_detected_objects, refined_query
 
-    def process_json_with_llm_classes(self, data_dict: dict) -> tuple[list[DetectedObject], str]:
+    def process_json_with_llm_classes(self, data_dict: dict) -> tuple[list, str]:
         """
         Process JSON data with LLM classes to detect objects.
         Modified to return both detected objects and the remade query.
+        Includes robust GPU memory management to prevent memory accumulation.
         """
         self.logger.info("Starting process_json_with_llm_classes...")
         if not self.query_parser_llm: 
             self.logger.error("Query Parser LLM not initialized."); return [], ""
         if not self.unik3d_model: 
             self.logger.error("UniK3D model not initialized."); return [], ""
-        
-        image_path = data_dict.get("image")
-        if not image_path: 
-            self.logger.error("'image' field (path) missing."); return [], ""
-        
-        try:
-            image_bgr_orig, image_bgr_processed, (w_orig, h_orig) = self._load_image(image_path)
-            h_proc, w_proc = image_bgr_processed.shape[:2]
 
-            image_rgb_orig = cv2.cvtColor(image_bgr_orig, cv2.COLOR_BGR2RGB)
-            image_pil_orig = PILImage.fromarray(image_rgb_orig) # For final cropping in original dimensions
-
-            image_rgb_processed = cv2.cvtColor(image_bgr_processed, cv2.COLOR_BGR2RGB) # For UniK3D and point colors
-        except Exception as e:
-            self.logger.error(f"Failed to load and prepare image {image_path}: {e}", exc_info=True); return [], ""
-
-        conversations = data_dict.get("conversations")
-        if not conversations or not isinstance(conversations, list) or not conversations[0].get("value"):
-            self.logger.error("Invalid 'conversations' structure."); return [], ""
-        
-        human_query_full = conversations[0]["value"]
-        human_query_for_llm = human_query_full.split("<image>\n", 1)[-1] if "<image>\n" in human_query_full else human_query_full
-
-        llm_parsed_regions, remaked_query = self.query_parser_llm.get_class_names_and_regions_from_query(human_query_for_llm)
-        if not llm_parsed_regions: 
-            self.logger.error("LLM failed to parse regions or returned no regions."); return [], remaked_query
-        
-        rle_masks_data = data_dict.get("rle")
-        if not isinstance(rle_masks_data, list): 
-            self.logger.error("Missing or invalid 'rle' field."); return [], remaked_query
-
-        image_tensor = torch.from_numpy(image_rgb_processed).permute(2,0,1).unsqueeze(0).float().to(self.device)
-        with torch.no_grad():
-            outputs = self.unik3d_model.infer(image_tensor, camera=None, normalize=True)
-        points_3d_global = outputs["points"].squeeze().permute(1,2,0).cpu().numpy() # Shape (h_proc, w_proc, 3)
-        
-        if not self._validate_dimensions(image_bgr_processed, points_3d_global, rle_masks_data, llm_parsed_regions):
-            self.logger.error("Dimension validation failed - aborting processing")
-            return [], remaked_query
-        
+        # Initialize return variables outside the try block
         detected_object_instances = []
-        min_initial_pts = self.cfg.get("min_points_threshold", 10)
-        min_processed_pts = self.cfg.get("min_points_threshold_after_denoise", 5)
-        min_bbox_volume = self.cfg.get("bbox_min_volume_threshold", 1e-7)
+        remaked_query = ""
 
-        wis3d_instance = None
-        if self.cfg.get("vis", False):
-            filename_prefix = data_dict.get("id", "scene") + "_" + self.timestamp
-            wis3d_instance = Wis3D(self.cfg.wis3d_folder, filename_prefix)
-            if points_3d_global.shape[:2] == image_rgb_processed.shape[:2]: # Check against processed
-                global_vertices = points_3d_global.reshape((-1, 3))
-                global_colors_uint8 = image_rgb_processed.reshape(-1, 3) # Colors from processed image
-                if len(global_vertices) > 0:
-                    wis3d_instance.add_point_cloud(
-                        vertices=global_vertices, colors=global_colors_uint8, 
-                        name="unik3d_global_scene_pts_processed_dims"
-                    )
-
-        for i in range(len(llm_parsed_regions)):
-            llm_region_info = llm_parsed_regions[i]
-            rle_obj = rle_masks_data[i]
-            rle_str = rle_obj.get("counts", None)
-            class_name = llm_region_info["class_name"]
-            description = llm_region_info["region_id"]
+        try:
+            image_path = data_dict.get("image")
+            if not image_path: 
+                self.logger.error("'image' field (path) missing."); return [], ""
             
-            # Mask in processed dimensions (h_proc, w_proc)
-            mask_2d_processed_dims = self._process_rle_mask_with_coordinate_validation(
-                rle_obj, h_proc, w_proc, i
-            )
-            if mask_2d_processed_dims is None:
-                self.logger.error(f"Failed to process RLE mask for {description} (idx {i})")
-                continue
+            try:
+                image_bgr_orig, image_bgr_processed, (w_orig, h_orig) = self._load_image(image_path)
+                h_proc, w_proc = image_bgr_processed.shape[:2]
+
+                image_rgb_orig = cv2.cvtColor(image_bgr_orig, cv2.COLOR_BGR2RGB)
+                image_pil_orig = PILImage.fromarray(image_rgb_orig) # For final cropping in original dimensions
+
+                image_rgb_processed = cv2.cvtColor(image_bgr_processed, cv2.COLOR_BGR2RGB) # For UniK3D and point colors
+            except Exception as e:
+                self.logger.error(f"Failed to load and prepare image {image_path}: {e}", exc_info=True); return [], ""
+
+            conversations = data_dict.get("conversations")
+            if not conversations or not isinstance(conversations, list) or not conversations[0].get("value"):
+                self.logger.error("Invalid 'conversations' structure."); return [], ""
             
-            if not self._validate_mask_dimensions(mask_2d_processed_dims, image_bgr_processed.shape, i):
-                self.logger.warning(f"Processed mask validation failed for {description} (idx {i})")
-                continue # Skip if mask shape is wrong, but not necessarily if empty/small (handled later)
+            human_query_full = conversations[0]["value"]
+            human_query_for_llm = human_query_full.split("<image>\n", 1)[-1] if "<image>\n" in human_query_full else human_query_full
+
+            llm_parsed_regions, remaked_query = self.query_parser_llm.get_class_names_and_regions_from_query(human_query_for_llm)
+            if not llm_parsed_regions: 
+                self.logger.error("LLM failed to parse regions or returned no regions."); return [], remaked_query
             
-            if not self._validate_point_cloud_mask_alignment(points_3d_global, mask_2d_processed_dims, i):
-                # This currently means shapes mismatch, which is critical.
-                self.logger.error(f"Point cloud and processed mask alignment failed for {description} (idx {i})")
-                continue
+            rle_masks_data = data_dict.get("rle")
+            if not isinstance(rle_masks_data, list): 
+                self.logger.error("Missing or invalid 'rle' field."); return [], remaked_query
 
-            # --- Convert 2D attributes to original image dimensions ---
-            # 1. Resize processed mask to original dimensions
-            mask_2d_orig_dims = cv2.resize(
-                mask_2d_processed_dims.astype(np.uint8),
-                (w_orig, h_orig), # Target original dimensions
-                interpolation=cv2.INTER_NEAREST
-            ).astype(bool)
+            # --- Major GPU Memory Allocation Point ---
+            image_tensor = torch.from_numpy(image_rgb_processed).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+            with torch.no_grad():
+                outputs = self.unik3d_model.infer(image_tensor, camera=None, normalize=True)
+            
+            # --- Immediately move data to CPU and free up GPU tensor references ---
+            points_3d_global = outputs["points"].squeeze().permute(1, 2, 0).cpu().numpy() # Shape (h_proc, w_proc, 3)
+            
+            # Explicitly delete the large GPU tensors. This signals to Python's garbage
+            # collector that the memory can be marked for reuse.
+            del outputs
+            del image_tensor
+            # --- End of primary GPU operations ---
+            
+            if not self._validate_dimensions(image_bgr_processed, points_3d_global, rle_masks_data, llm_parsed_regions):
+                self.logger.error("Dimension validation failed - aborting processing")
+                return [], remaked_query
+            
+            min_initial_pts = self.cfg.get("min_points_threshold", 10)
+            min_processed_pts = self.cfg.get("min_points_threshold_after_denoise", 5)
+            min_bbox_volume = self.cfg.get("bbox_min_volume_threshold", 1e-7)
 
-            # 2. Calculate BBox from processed mask, then scale it to original dimensions
-            bbox_2d_np_proc = get_bounding_box_from_mask(mask_2d_processed_dims)
-            bbox_2d_np_orig = None
-            image_crop_pil_orig = None
+            wis3d_instance = None
+            if self.cfg.get("vis", False):
+                filename_prefix = data_dict.get("id", "scene") + "_" + self.timestamp
+                wis3d_instance = Wis3D(self.cfg.wis3d_folder, filename_prefix)
+                if points_3d_global.shape[:2] == image_rgb_processed.shape[:2]:
+                    global_vertices = points_3d_global.reshape((-1, 3))
+                    global_colors_uint8 = image_rgb_processed.reshape(-1, 3)
+                    if len(global_vertices) > 0:
+                        wis3d_instance.add_point_cloud(
+                            vertices=global_vertices, colors=global_colors_uint8, 
+                            name="unik3d_global_scene_pts_processed_dims"
+                        )
 
-            if bbox_2d_np_proc is not None:
-                if w_proc == 0 or h_proc == 0: # Should be caught by earlier checks
-                    self.logger.error(f"Processed image dimensions are zero for {description}, cannot scale bbox.");
+            for i in range(len(llm_parsed_regions)):
+                llm_region_info = llm_parsed_regions[i]
+                rle_obj = rle_masks_data[i]
+                rle_str = rle_obj.get("counts", None)
+                class_name = llm_region_info["class_name"]
+                description = llm_region_info["region_id"]
+                
+                mask_2d_processed_dims = self._process_rle_mask_with_coordinate_validation(rle_obj, h_proc, w_proc, i)
+                if mask_2d_processed_dims is None:
+                    self.logger.error(f"Failed to process RLE mask for {description} (idx {i})"); continue
+                
+                if not self._validate_mask_dimensions(mask_2d_processed_dims, image_bgr_processed.shape, i):
+                    self.logger.warning(f"Processed mask validation failed for {description} (idx {i})"); continue
+                
+                if not self._validate_point_cloud_mask_alignment(points_3d_global, mask_2d_processed_dims, i):
+                    self.logger.error(f"Point cloud and processed mask alignment failed for {description} (idx {i})"); continue
+
+                mask_2d_orig_dims = cv2.resize(mask_2d_processed_dims.astype(np.uint8), (w_orig, h_orig), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                bbox_2d_np_proc = get_bounding_box_from_mask(mask_2d_processed_dims)
+                bbox_2d_np_orig, image_crop_pil_orig = None, None
+
+                if bbox_2d_np_proc is not None:
+                    if w_proc > 0 and h_proc > 0:
+                        scale_x, scale_y = w_orig / w_proc, h_orig / h_proc
+                        x1_orig, y1_orig = int(round(bbox_2d_np_proc[0] * scale_x)), int(round(bbox_2d_np_proc[1] * scale_y))
+                        x2_orig, y2_orig = int(round(bbox_2d_np_proc[2] * scale_x)), int(round(bbox_2d_np_proc[3] * scale_y))
+                        bbox_2d_np_orig = np.array([x1_orig, y1_orig, x2_orig, y2_orig])
+                    
+                        try:
+                            x1_c, y1_c = max(0, x1_orig), max(0, y1_orig)
+                            x2_c, y2_c = min(w_orig, x2_orig), min(h_orig, y2_orig)
+                            if x2_c > x1_c and y2_c > y1_c:
+                                image_crop_pil_orig = image_pil_orig.crop((x1_c, y1_c, x2_c, y2_c))
+                            else: self.logger.warning(f"Invalid crop dimensions for {description} (idx {i})")
+                        except Exception as e_crop:
+                            self.logger.warning(f"Crop error on original image for {description} (idx {i}): {e_crop}")
+                    else:
+                        self.logger.error(f"Processed image dimensions are zero for {description}, cannot scale bbox.")
                 else:
-                    scale_x = w_orig / w_proc
-                    scale_y = h_orig / h_proc
+                    self.logger.warning(f"No 2D bbox from processed mask for {description} (idx {i}).")
 
-                    x1_orig = int(round(bbox_2d_np_proc[0] * scale_x))
-                    y1_orig = int(round(bbox_2d_np_proc[1] * scale_y))
-                    x2_orig = int(round(bbox_2d_np_proc[2] * scale_x))
-                    y2_orig = int(round(bbox_2d_np_proc[3] * scale_y))
-                    bbox_2d_np_orig = np.array([x1_orig, y1_orig, x2_orig, y2_orig])
+                obj_points = points_3d_global[mask_2d_processed_dims]
+                if len(obj_points) < min_initial_pts: 
+                    self.logger.debug(f"Too few initial points ({len(obj_points)}) for {description} (idx {i})."); continue
                 
-                    # 3. Crop from original PIL image using scaled bbox (original dimensions)
-                    try:
-                        # Ensure bbox coordinates are within image bounds
-                        x1_c_orig = max(0, min(x1_orig, w_orig-1))
-                        y1_c_orig = max(0, min(y1_orig, h_orig-1))
-                        x2_c_orig = max(x1_c_orig+1, min(x2_orig, w_orig))  # Ensure x2 > x1
-                        y2_c_orig = max(y1_c_orig+1, min(y2_orig, h_orig))  # Ensure y2 > y1
-
-                        # Additional validation
-                        crop_width = x2_c_orig - x1_c_orig
-                        crop_height = y2_c_orig - y1_c_orig
-                        
-                        if crop_width > 0 and crop_height > 0:
-                            self.logger.debug(f"Cropping {description} from ({x1_c_orig},{y1_c_orig}) to ({x2_c_orig},{y2_c_orig}), size: {crop_width}x{crop_height}")
-                            image_crop_pil_orig = image_pil_orig.crop((x1_c_orig, y1_c_orig, x2_c_orig, y2_c_orig))
-                        else:
-                            self.logger.warning(f"Invalid crop dimensions for {description} (idx {i}): {crop_width}x{crop_height}")
-                            image_crop_pil_orig = None
-                    except Exception as e_crop:
-                        self.logger.warning(f"Crop error on original image for {description} (idx {i}): {e_crop}")
-                        image_crop_pil_orig = None
-            else:
-                self.logger.warning(f"No 2D bbox from processed mask for {description} (idx {i}). Original bbox and crop will be None.")
-            
-            # --- 3D Processing (uses processed_dims mask and points_3d_global) ---
-            obj_points = points_3d_global[mask_2d_processed_dims]
-            if len(obj_points) < min_initial_pts: 
-                self.logger.debug(f"Too few initial points ({len(obj_points)} < {min_initial_pts}) for {description} (idx {i}) from processed mask."); 
-                continue
-            
-            pcd_obj = o3d.geometry.PointCloud()
-            pcd_obj.points = o3d.utility.Vector3dVector(obj_points)
-            # Colors from processed image, corresponding to obj_points
-            obj_colors_rgb_0_255 = image_rgb_processed[mask_2d_processed_dims] 
-            if len(obj_colors_rgb_0_255) == len(obj_points): 
-                pcd_obj.colors = o3d.utility.Vector3dVector(obj_colors_rgb_0_255 / 255.0)
-            
-            processed_pcd = process_pcd_for_unik3d(self.cfg, pcd_obj)
-
-            if not processed_pcd.has_points() or len(processed_pcd.points) < min_processed_pts:
-                self.logger.debug(f"Too few processed points ({len(processed_pcd.points) if processed_pcd.has_points() else 0} < {min_processed_pts}) for {description} (idx {i})."); 
-                continue
-            
-            aabb_3d, obb_3d = get_bounding_box_for_unik3d(self.cfg, processed_pcd)
-            if aabb_3d.is_empty() or aabb_3d.volume() < min_bbox_volume :
-                self.logger.debug(f"Small/empty 3D bbox (Volume: {aabb_3d.volume() if not aabb_3d.is_empty() else 'empty'}) for {description} (idx {i})."); 
-                continue
-            
-            det_obj = DetectedObject(
-                class_name, description, 
-                mask_2d_orig_dims,
-                rle_str,
-                bbox_2d_np_orig,            # BBox in original dimensions (or None)
-                processed_pcd,              # 3D data relative to processed image
-                obb_3d,                     # 3D data relative to processed image
-                aabb_3d,                    # 3D data relative to processed image
-                image_crop_pil_orig         # Crop from original image (or None)
-            )
-            detected_object_instances.append(det_obj)
-            self.logger.info(f"Created DetectedObject for {description} ({class_name}) (idx {i}) with original-dim 2D data.")
-
-            if wis3d_instance and processed_pcd.has_points():
-                cmap = matplotlib.colormaps.get_cmap("turbo")
-                instance_color_float_0_1 = np.array(cmap(i / max(1, len(llm_parsed_regions) -1) if len(llm_parsed_regions) > 1 else 0.5)[:3])
+                pcd_obj = o3d.geometry.PointCloud()
+                pcd_obj.points = o3d.utility.Vector3dVector(obj_points)
+                obj_colors_rgb_0_255 = image_rgb_processed[mask_2d_processed_dims] 
+                if len(obj_colors_rgb_0_255) == len(obj_points): 
+                    pcd_obj.colors = o3d.utility.Vector3dVector(obj_colors_rgb_0_255 / 255.0)
                 
-                pcd_to_vis = o3d.geometry.PointCloud(processed_pcd) # This is the processed 3D point cloud
-                pcd_to_vis.paint_uniform_color(instance_color_float_0_1) 
+                processed_pcd = process_pcd_for_unik3d(self.cfg, pcd_obj)
 
-                vertices_to_vis = np.asarray(pcd_to_vis.points)
-                colors_to_vis_uint8 = (np.asarray(pcd_to_vis.colors) * 255).astype(np.uint8)
+                if not processed_pcd.has_points() or len(processed_pcd.points) < min_processed_pts:
+                    self.logger.debug(f"Too few processed points for {description} (idx {i})."); continue
+                
+                aabb_3d, obb_3d = get_bounding_box_for_unik3d(self.cfg, processed_pcd)
+                if aabb_3d.is_empty() or aabb_3d.volume() < min_bbox_volume:
+                    self.logger.debug(f"Small/empty 3D bbox for {description} (idx {i})."); continue
+                
+                det_obj = DetectedObject(
+                    class_name, description, mask_2d_orig_dims, rle_str,
+                    bbox_2d_np_orig, processed_pcd, obb_3d, aabb_3d, image_crop_pil_orig
+                )
+                detected_object_instances.append(det_obj)
+                self.logger.info(f"Created DetectedObject for {description} ({class_name}) (idx {i}).")
 
-                if len(vertices_to_vis) > 0:
+                if wis3d_instance and processed_pcd.has_points():
+                    cmap = matplotlib.colormaps.get_cmap("turbo")
+                    color_val = i / max(1, len(llm_parsed_regions) - 1)
+                    instance_color = np.array(cmap(color_val)[:3])
+                    
+                    pcd_to_vis = o3d.geometry.PointCloud(processed_pcd).paint_uniform_color(instance_color)
                     wis3d_instance.add_point_cloud(
-                        vertices=vertices_to_vis, colors=colors_to_vis_uint8, 
+                        vertices=np.asarray(pcd_to_vis.points), 
+                        colors=(np.asarray(pcd_to_vis.colors) * 255).astype(np.uint8), 
                         name=f"{i:02d}_{class_name}_reg_{description}_3Dpts"
                     )
-                
-                aa_center,_,aa_extent = axis_aligned_bbox_to_center_euler_extent_for_unik3d(aabb_3d.get_min_bound(), aabb_3d.get_max_bound())
-                wis3d_instance.add_boxes(positions=np.array([aa_center]), eulers=np.array([(0,0,0)]), extents=np.array([aa_extent]), name=f"{i:02d}_{class_name}_aa_bbox3D_reg_{description}")
-                if not obb_3d.is_empty() and np.all(np.array(obb_3d.extent) > 1e-6):
-                    or_center,or_eulers,or_extent = oriented_bbox_to_center_euler_extent_for_unik3d(obb_3d.center, obb_3d.R, obb_3d.extent)
-                    wis3d_instance.add_boxes(positions=np.array([or_center]), eulers=np.array([or_eulers]), extents=np.array([or_extent]), name=f"{i:02d}_{class_name}_or_bbox3D_reg_{description}")
-        
-        self.logger.info(f"Initial object detection finished. Generated {len(detected_object_instances)} objects.")
-        
-        # Add mask visualization if objects were detected
-        if detected_object_instances:
-            vis_save_path = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), 
-                                        f"mask_visualization_{data_dict.get('id', 'scene')}_{self.timestamp}.jpg")
-            self.visualize_all_masks_on_original(image_bgr_orig, detected_object_instances, vis_save_path)
+                    
+                    aa_center,_,aa_extent = axis_aligned_bbox_to_center_euler_extent_for_unik3d(aabb_3d.get_min_bound(), aabb_3d.get_max_bound())
+                    wis3d_instance.add_boxes(positions=np.array([aa_center]), eulers=np.zeros((1,3)), extents=np.array([aa_extent]), name=f"{i:02d}_{class_name}_aa_bbox3D")
+                    
+                    if not obb_3d.is_empty() and np.all(np.array(obb_3d.extent) > 1e-6):
+                        or_center, or_eulers, or_extent = oriented_bbox_to_center_euler_extent_for_unik3d(obb_3d.center, obb_3d.R, obb_3d.extent)
+                        wis3d_instance.add_boxes(positions=np.array([or_center]), eulers=np.array([or_eulers]), extents=np.array([or_extent]), name=f"{i:02d}_{class_name}_or_bbox3D")
+            
+            self.logger.info(f"Finished processing. Generated {len(detected_object_instances)} objects.")
+            
+            if detected_object_instances:
+                vis_save_path = os.path.join(self.cfg.get("log_dir", "./temp_outputs/log_focused"), 
+                                            f"mask_visualization_{data_dict.get('id', 'scene')}_{self.timestamp}.jpg")
+                self.visualize_all_masks_on_original(image_bgr_orig, detected_object_instances, vis_save_path)
 
-        return detected_object_instances, remaked_query
+            return detected_object_instances, remaked_query
 
+        finally:
+            # --- GPU MEMORY CLEANUP ---
+            # This block will always execute, whether the 'try' block completes
+            # successfully or raises an exception, ensuring no memory leaks.
+            
+            # 1. Manually trigger Python's garbage collector. This helps ensure that
+            #    the 'del' statements above have taken effect and Python no longer
+            #    holds references to the GPU tensors.
+            gc.collect()
+
+            # 2. Tell PyTorch to release all "cached" memory that is not currently
+            #    in use. This is the main step that returns memory to the OS/driver.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                self.logger.debug(
+                    f"GPU cache cleared. "
+                    f"Memory Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB. "
+                    f"Memory Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB."
+                )
+                 
     def merge_regions_with_identical_masks(self, detected_objects: list[DetectedObject], query: str) -> tuple[str, list[DetectedObject]]:
         """
         Merge regions with identical RLE masks and use LLM to refine the query.

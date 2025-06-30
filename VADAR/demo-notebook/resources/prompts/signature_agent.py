@@ -1,7 +1,5 @@
 SIGNATURE_PROMPT = """
 Propose only new method signatures to add to the existing API.
-Also, You MUST at least build signatures for the methods below:
-{vqa_functions}
 
 Available Primitives: image, float, string, list, int
 
