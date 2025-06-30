@@ -64,15 +64,14 @@ Answers a question about an object shown in a bounding box.
 
 Args:
     image (PIL.Image.Image): Image of the scene.
-    depth (PIL.Image.Image): Depth Image of the scene.
     question (string): Question about the object in the bounding box. For each DetectedObject in objects, there must a corresponding <mask> tag in the question.
-    objects (list[DetectedObject]): A list of (DetectedObject) objects to consider for VLM.
+    object (DetectedObject): A (DetectedObject) object to consider for VLM.
     
 
 Returns:
     string: Answer to the question about the object in the image.
 \"\"\"
-def vqa(image, depth, question, objects):
+def vqa(image, question, object):
 
 \"\"\"
 Finds regions that significantly overlap with a parent region. MUST USE for counting objects inside a region / DetectedObject

@@ -2,7 +2,7 @@ import os
 import sys
 import numpy as np
 import json
-from PIL import Image, ImageDraw
+from PIL import Image as PILImage, ImageDraw
 from io import BytesIO
 import base64
 import time
@@ -12,12 +12,14 @@ from rich.console import Console
 from rich.syntax import Syntax      
 from rich.padding import Padding
 from rich.style import Style
-import re
+import re #hello
 # import groundingdino.datasets.transforms as T_gd
 # from groundingdino.util.inference import load_model, predict
 from unik3d.models import UniK3D
 import torchvision.transforms as TV_T
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import google.generativeai as genai
+import open3d as o3d
 
 from pathlib import Path
 
@@ -45,6 +47,43 @@ from typing import List, Dict, Any, Optional, Union
 
 import requests # For making HTTP requests
 from PIL import Image # For image handling
+
+import textwrap
+
+gemini_api_key = 'AIzaSyCJHta9VITkW9ZNnTOuqpvPPIrpSSgCqXg'
+gemini_model_name = 'gemini-2.5-flash'
+
+def normalize_indentation(code_block: str, indent_with: str = "    ") -> str:
+    """
+    Normalizes the indentation of a code block.
+
+    This function takes a string containing a block of Python code,
+    which may have inconsistent leading whitespace, and reformats it.
+    It removes any common leading whitespace from every line, then
+    indents the entire block with a specified string (e.g., 4 spaces).
+    This correctly preserves nested indentation.
+
+    Args:
+        code_block (str): A string containing the Python code.
+        indent_with (str): The string to use for indenting each line.
+                           Defaults to "    " (4 spaces).
+
+    Returns:
+        str: The correctly indented code block.
+    """
+    if not code_block:
+        return ""
+
+    # textwrap.dedent removes the common leading whitespace from every line.
+    # This is the key to preserving relative indentation.
+    dedented_code = textwrap.dedent(code_block)
+
+    # Now, add our own consistent indent to each line.
+    indented_lines = []
+    for line in dedented_code.strip().split('\n'):
+        indented_lines.append(f"{indent_with}{line}")
+
+    return "\n".join(indented_lines)
 
 # Helper to encode image to base64
 def encode_image_to_base64(image_path_or_pil: Union[str, Image.Image]) -> str:
@@ -790,6 +829,177 @@ class GeneratorVL:
             print(f"InternVL3 Generator: Error during generation: {e}")
             raise
 
+class GeneratorGemini:
+    """
+    An OpenAI-compatible client that connects to the Google AI Studio (Gemini) API
+    to generate responses from text and image inputs.
+    """
+    def __init__(self, model_name="gemini-1.5-pro-latest", temperature=0.2,
+                 max_new_tokens=4096, api_key=None):
+        """
+        Initializes the Gemini client.
+
+        Args:
+            model_name (str): The name of the Gemini model to use.
+            temperature (float): The *default* sampling temperature for generation.
+                                 This can be overridden in the `generate` method.
+            max_new_tokens (int): The maximum number of tokens to generate.
+            api_key (str, optional): Your Google AI Studio API key. 
+                                     If not provided, it will be read from the 
+                                     'GEMINI_API_KEY' environment variable.
+        """
+        self.temperature = temperature
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+
+        # --- API Key and Client Configuration ---
+        api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Gemini API key not found. Please provide it in the constructor "
+                "or set the 'GEMINI_API_KEY' environment variable."
+            )
+        
+        genai.configure(api_key=api_key)
+        
+        print(f"Gemini Generator: Client configured for model: {self.model_name}")
+
+        # --- Default Model and Generation Configuration ---
+        # This config will be used if no per-call config is provided.
+        self.default_generation_config = genai.types.GenerationConfig(
+            max_output_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+        )
+
+        self.model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self.default_generation_config
+        )
+        
+        # Initialize conversation history
+        self.history = []
+
+    def _load_image(self, image_path: str) -> Image.Image:
+        """
+        Loads an image from a file path into a PIL Image object.
+        The Gemini API can directly handle PIL Image objects.
+        """
+        try:
+            image = Image.open(image_path).convert('RGB')
+            print(f"Gemini Generator: Loaded image '{image_path}' ({image.size[0]}x{image.size[1]})")
+            return image
+        except FileNotFoundError:
+            print(f"Gemini Generator: Error - Image file not found at {image_path}")
+            raise
+        except Exception as e:
+            print(f"Gemini Generator: Error loading image {image_path}: {e}")
+            raise
+
+    def _prepare_api_request(self, prompt=None, messages=None, images=None):
+        """
+        Prepares the content and history for the Gemini API call.
+        """
+        if messages:
+            history = messages
+            last_message = history[-1]
+            api_history = [msg for msg in history[:-1]] 
+            prompt_text = last_message['content']
+        elif prompt:
+            api_history = []
+            history = [{"role": "user", "content": prompt}]
+            prompt_text = prompt
+        else:
+            raise ValueError("Either 'prompt' or 'messages' must be provided.")
+
+        formatted_history = []
+        for msg in api_history:
+            role = "model" if msg["role"] == "assistant" else "user"
+            formatted_history.append({"role": role, "parts": [msg["content"]]})
+
+        prompt_content = []
+        if prompt_text:
+            prompt_content.append(prompt_text)
+            
+        if images:
+            if isinstance(images, str):
+                images = [images]
+            
+            for img_path in images:
+                try:
+                    pil_image = self._load_image(img_path)
+                    prompt_content.append(pil_image)
+                except FileNotFoundError:
+                    error_text = f"[Error: Could not load image at path: {img_path}]"
+                    prompt_content.insert(0, error_text)
+
+        return prompt_content, formatted_history, history
+
+
+    def generate(self, prompt: str = None, messages: list = None, images: list = None, temperature: float = None):
+        """
+        Generates a response from the Gemini API based on the provided inputs.
+
+        Args:
+            prompt (str, optional): A single text prompt to start a new conversation.
+            messages (list, optional): A list of conversation history messages.
+                                       Format: [{'role': 'user'|'assistant', 'content': '...'}, ...]
+            images (list or str, optional): A path or list of paths to image files.
+            temperature (float, optional): The sampling temperature for this specific call.
+                                           If None, the default temperature from the
+                                           constructor is used.
+
+        Returns:
+            tuple[str, list]: A tuple containing:
+                              - The generated response text (str).
+                              - The updated full conversation history (list).
+        """
+        try:
+            # Prepare data for the API
+            prompt_content, api_history, full_history = self._prepare_api_request(
+                prompt=prompt, messages=messages, images=images
+            )
+            
+            # --- MODIFICATION START ---
+            
+            # 1. Determine the temperature to use for this specific call.
+            #    If a temperature is passed to this method, use it. Otherwise, use the class default.
+            effective_temperature = temperature if temperature is not None else self.temperature
+            print(f"Gemini Generator: Using temperature: {effective_temperature}")
+
+            # 2. Create a generation config for this specific request.
+            #    This allows overriding the model's default config.
+            current_generation_config = genai.types.GenerationConfig(
+                max_output_tokens=self.max_new_tokens,
+                temperature=effective_temperature,
+            )
+
+            # Start a chat session with the historical context
+            chat = self.model.start_chat(history=api_history)
+            
+            # Send the new message and pass the per-call generation config
+            print("Gemini Generator: Sending request to API...")
+            response = chat.send_message(
+                prompt_content,
+                generation_config=current_generation_config  # <-- Pass the config here
+            )
+            
+            # --- MODIFICATION END ---
+            
+            response_text = response.text
+            print("Gemini Generator: Received response.")
+
+            # Update the full history with the model's response
+            full_history.append({"role": "assistant", "content": response_text})
+            
+            # Update the internal state
+            self.history = full_history
+
+            return response_text, self.history
+
+        except Exception as e:
+            error_message = f"Gemini Generator: Error during generation: {e}"
+            print(error_message)
+            return error_message, self.history
 # --- Globals ---
 qwen_generator = None
 device = None
@@ -819,7 +1029,7 @@ def initialize_modules(
     other_models_device_preference="cuda:0",
     unik3d_model_size="Large"
 ):
-    global qwen_generator, spatialrgpt_generator, device, unik3d_model
+    global qwen_generator, gemini_generator, device, unik3d_model
 
     # Device setup for GroundingDINO and UniK3D
     if "cuda" in str(other_models_device_preference) and torch.cuda.is_available():
@@ -864,19 +1074,20 @@ def initialize_modules(
         qwen_generator = None
 
     # --- Initialize SpatialRGPT API Client Wrapper ---
-    print(f"Initializing SpatialRGPT Client for API at '{spatialrgpt_api_base_url}'")
+    print(f"Initializing Gemini Client for API with model '{gemini_model_name}'")
     try:
-        spatialrgpt_generator = SpatialRGPTClient(
-            base_url=spatialrgpt_api_base_url
+        gemini_generator = GeneratorGemini(
+            api_key=gemini_api_key,
+            model_name=gemini_model_name
         )
         # This client does not load a model locally; it calls an API.
         # Its 'device' and 'dtype' are just placeholders indicating it's API-based.
-        print("SpatialRGPT API Client Wrapper initialized successfully.")
+        print("Gemini API Client Wrapper initialized successfully.")
     except Exception as e:
-        print(f"Error initializing SpatialRGPT API Client Wrapper: {e}")
+        print(f"Error initializing Gemini API Client Wrapper: {e}")
         import traceback
         traceback.print_exc()
-        spatialrgpt_generator = None
+        gemini_generator = None
 
     # Initialize GroundingDINO
     # print("Initializing GroundingDINO")
@@ -1047,8 +1258,8 @@ from PIL import Image
 import cv2 # For resizing masks if needed (though your code already does it)
 from typing import Tuple
 
-# Assume spatialrgpt_generator is initialized globally and has the necessary attributes/methods
-# global spatialrgpt_generator
+# Assume gemini_generator is initialized globally and has the necessary attributes/methods
+# global gemini_generator
 def generate_spatial_vlm_response(
     prompt: Optional[str] = None,
     messages: Optional[List[Dict[str, Any]]] = None,
@@ -1301,11 +1512,25 @@ def loc(image, object_prompt):
 
     return bboxes, trace_html
 
-def extract_2d_bounding_box(detected_object):
-    return detected_object.bounding_box_2d.astype(int), []
+# MODIFIED: extract_2d_bounding_box to add HTML tracing
+def extract_2d_bounding_box(detected_object: DetectedObject) -> Tuple[np.ndarray, List[str]]:
+    """Extracts the 2D bounding box and returns it with an HTML trace."""
+    trace_html = []
+    bbox = detected_object.bounding_box_2d.astype(int)
+    trace_html.append(f"<h4>Extract 2D Bounding Box</h4>")
+    trace_html.append(f"<p>From object: '<b>{detected_object.description}</b>'</p>")
+    trace_html.append(f"<p>Result: <b>{bbox.tolist()}</b></p>")
+    return bbox, trace_html
     
-def extract_3d_bounding_box(detected_object):
-    return detected_object.bounding_box_3d_oriented.get_box_points(), []
+# MODIFIED: extract_3d_bounding_box to add HTML tracing
+def extract_3d_bounding_box(detected_object: DetectedObject) -> Tuple[o3d.utility.Vector3dVector, List[str]]:
+    """Extracts the 3D oriented bounding box points and returns them with an HTML trace."""
+    trace_html = []
+    points_vector = detected_object.bounding_box_3d_oriented.get_box_points()
+    trace_html.append(f"<h4>Extract 3D Bounding Box Points</h4>")
+    trace_html.append(f"<p>From object: '<b>{detected_object.description}</b>'</p>")
+    trace_html.append(f"<p>Result: Extracted <b>{len(points_vector)}</b> points for the oriented bounding box.</p>")
+    return points_vector, trace_html
 
 from typing import List, Tuple
 from sentence_transformers import SentenceTransformer
@@ -1319,42 +1544,44 @@ embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', trust_remote_co
 from typing import List
 from sklearn.metrics.pairwise import cosine_similarity
 
-def is_similar_text(text1: str, text2: str) -> bool:
+# MODIFIED: is_similar_text to add HTML tracing
+def is_similar_text(text1: str, text2: str) -> Tuple[bool, List[str]]:
     """
     Determine whether two texts are semantically similar using cosine similarity.
-
-    Args:
-        text1 (str): First text input.
-        text2 (str): Second text input.
-
-    Returns:
-        bool: True if similarity is above threshold, False otherwise.
+    Now returns a tuple with the result and an HTML trace.
     """
+    trace_html = []
     threshold = 0.5
     prompt_embedding = embedding_model.encode([text1], convert_to_numpy=True)
     class_embedding = embedding_model.encode([text2], convert_to_numpy=True)
 
     similarity = cosine_similarity(prompt_embedding, class_embedding)[0][0]
-    return similarity > threshold
+    answer = similarity > threshold
 
-def retrieve_objects(detected_objects: List[DetectedObject], object_prompt: str) -> List[DetectedObject]:
+    trace_html.append(f"<h4>Is Similar Text</h4>")
+    trace_html.append(f"<p>Comparing '{text1}' and '{text2}'.</p>")
+    trace_html.append(f"<p>Similarity Score: <b>{similarity:.4f}</b> (Threshold: >{threshold})</p>")
+    trace_html.append(f"<p>Result: <b>{answer}</b></p>")
+
+    return answer, trace_html
+
+# MODIFIED: retrieve_objects to add detailed HTML tracing
+def retrieve_objects(detected_objects: List[DetectedObject], object_prompt: str) -> Tuple[List[DetectedObject], List[str]]:
     """
-    Retrieve DetectedObject instances matching the given object_prompt using semantic similarity.
-
-    Args:
-        detected_objects (List[DetectedObject]): List of detected objects.
-        object_prompt (str): Description or name of the desired object(s).
-                             Use "objects" to return all detected objects.
-
-    Returns:
-        List[DetectedObject]: Matching detected objects with similarity > 0.9, sorted by similarity score.
+    Retrieve DetectedObject instances matching a prompt using semantic similarity.
+    Now returns a tuple with the result list and an HTML trace.
     """
+    trace_html = []
     if not detected_objects:
-        return [], []
+        trace_html.append("<p>Retrieve Objects: Called with an empty list of detected_objects.</p>")
+        return [], trace_html
 
-    # Return all objects if prompt is generic
+    trace_html.append(f"<h4>Retrieve Objects</h4>")
+    trace_html.append(f"<p>Prompt: '<b>{object_prompt}</b>'</p>")
+
     if object_prompt.strip().lower() in ("object", "objects", "items", "things"):
-        return detected_objects, []
+        trace_html.append(f"<p>Generic prompt detected. Returning all {len(detected_objects)} objects.</p>")
+        return detected_objects, trace_html
 
     class_names = [obj.class_name for obj in detected_objects]
     
@@ -1363,39 +1590,50 @@ def retrieve_objects(detected_objects: List[DetectedObject], object_prompt: str)
 
     similarities = cosine_similarity(prompt_embedding, class_embeddings)[0]
     
-    # Filter and sort only those with similarity > 0.9
     scored_objects = [(score, obj) for score, obj in zip(similarities, detected_objects) if score > 0.9]
     scored_objects.sort(reverse=True, key=lambda x: x[0])
 
-    return [obj for score, obj in scored_objects], []
+    result_objects = [obj for score, obj in scored_objects]
 
-def get_3D_object_size(detected_object) -> Tuple[float, float, float]:
+    trace_html.append(f"<p>Found <b>{len(result_objects)}</b> matching objects (similarity > 0.9) from a total of {len(detected_objects)}.</p>")
+    if scored_objects:
+        table = "<table border='1' style='border-collapse: collapse; width: 100%;'><tr><th>Similarity</th><th>Class Name</th><th>Description</th></tr>"
+        for score, obj in scored_objects:
+            table += f"<tr><td>{score:.3f}</td><td>{obj.class_name}</td><td>{obj.description}</td></tr>"
+        table += "</table>"
+        trace_html.append(table)
+
+    return result_objects, trace_html
+    
+# MODIFIED: get_3D_object_size to add HTML tracing
+def get_3D_object_size(detected_object: DetectedObject) -> Tuple[Tuple[float, float, float], List[str]]:
     """
-    Returns the width, height, and length of the object in 3D real-world (meters) space.
+    Returns the width, height, and length of the object in 3D real-world (meters) space,
+    along with an HTML trace.
 
     Args:
         detected_object (DetectedObject): A detected object with a valid oriented bounding box.
 
     Returns:
-        tuple: (width, height, length) in meters.
+        tuple: ((width, height, length), trace_html)
     """
-    # Get the oriented bounding box
+    trace_html = []
     obb = detected_object.bounding_box_3d_oriented
-
-    # The extent of the box gives the size in each local axis (x, y, z)
     extent = obb.extent
-
-    # By convention:
-    # - x-axis → width
-    # - y-axis → depth or length
-    # - z-axis → height
     width = float(extent[0])
-    length = float(extent[1])  # often treated as depth/length depending on coordinate system
+    length = float(extent[1])
     height = float(extent[2])
+    result_tuple = (width, height, length)
 
-    return (width, height, length), ([])
+    trace_html.append(f"<h4>Get 3D Object Size</h4>")
+    trace_html.append(f"<p>From object: '<b>{detected_object.description}</b>'</p>")
+    trace_html.append(f"<p>OBB Extent (W, D, H): [{extent[0]:.3f}, {extent[1]:.3f}, {extent[2]:.3f}] meters</p>")
+    trace_html.append(f"<p>Result (Width, Height, Length): <b>{result_tuple}</b> meters</p>")
 
-def depth(image, bbox): 
+    return result_tuple, trace_html
+
+def depth(image, bbox):
+
     trace_html = []
     global unik3d_model, device 
 
@@ -1452,7 +1690,122 @@ import re
 import base64
 from PIL import Image
 
-def _vqa_predict(img, depth, masks, question):
+def _vqa_predict(img, question, holistic=False):
+    global gemini_generator
+    """VQA prediction using InternVL3 model"""
+    try:
+        # Format the question with VQA prompt template
+        prompt = VQA_PROMPT.format(question=question)
+        
+        # Create full prompt with image token
+        full_prompt = f"<image> {prompt}"
+        
+        # Create temporary directory for image storage
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = os.path.join(tmpdir, "temp_image.png")
+            
+            # Save PIL image to temporary file
+            img.save(temp_path, format=img.format)
+            
+            # Call InternVL3 generate function with image path
+            output, _ = gemini_generator.generate(
+                prompt=full_prompt,
+                images=[temp_path]  # Pass image path to multimodal handler
+            )
+        
+        # Extract answer from response
+        answer_match = re.search(r"<answer>(.*?)</answer>", output, re.DOTALL)
+        if answer_match:
+            return answer_match.group(1).strip().lower()
+        return output.strip().lower()
+        
+    except Exception as e:
+        print(f"Error in VQA prediction: {e}")
+        return f"Error: {str(e)}"
+
+def vqa(image: PILImage.Image, question: str, object: DetectedObject):
+    """
+    Performs Visual Question Answering on an image, optionally focusing on a specific detected object.
+
+    If a detected_object with a valid bounding box and mask is provided, the image is
+    cropped and masked to show only the object against a transparent background before
+    being passed to the VQA model.
+    """
+    trace_html = []
+    
+    # Extract bounding box and mask from the detected object
+    bbox = object.bounding_box_2d
+    mask_2d = object.segmentation_mask_2d
+
+    is_holistic = False
+    # Check for holistic query (no bbox or bbox covers the whole image)
+    if bbox is None or \
+       (isinstance(bbox, (list, tuple, np.ndarray)) and len(bbox) == 4 and
+        bbox[0] <= 0 and bbox[1] <= 0 and
+        bbox[2] >= image.width - 1 and bbox[3] >= image.height - 1):
+        img_for_vqa_display = image 
+        trace_html.append(f"<p>VQA (holistic query): {question}</p>")
+        trace_html.append(html_embed_image(image, 300))
+        is_holistic = True
+    else:
+        try:
+            cmin, rmin, cmax, rmax = [int(c) for c in bbox]
+            if cmax > cmin and rmax > rmin:
+                # --- START of MODIFICATION ---
+
+                # 1. Crop the original image to the bounding box
+                cropped_image_pil = image.crop((cmin, rmin, cmax, rmax))
+
+                # 2. Crop the segmentation mask to the same bounding box dimensions.
+                # The mask_2d is (img_height, img_width), so indexing is [rows, cols] -> [y, x].
+                cropped_mask_np = mask_2d[rmin:rmax, cmin:cmax]
+
+                # 3. Convert cropped image to RGBA to ensure it has an alpha channel for transparency.
+                cropped_image_rgba = cropped_image_pil.convert('RGBA')
+                cropped_image_np = np.array(cropped_image_rgba)
+
+                # 4. Use the mask to create a new alpha channel.
+                # `cropped_mask_np` is a boolean or 0/1 array. Multiplying by 255 creates the alpha values.
+                alpha_channel = (cropped_mask_np * 255).astype(np.uint8)
+
+                # 5. Replace the original alpha channel with the new one from the mask.
+                # Pixels corresponding to the object will be opaque (255), others transparent (0).
+                cropped_image_np[:, :, 3] = alpha_channel
+
+                # 6. Convert the final NumPy array back to a PIL image. This is the image for the VLM.
+                img_for_vqa_display = PILImage.fromarray(cropped_image_np, 'RGBA')
+
+                # --- END of MODIFICATION ---
+                
+                # Update HTML trace to show the process and the final masked image
+                trace_html.append(f"<p>VQA (region query): {question}</p>")
+                boxed_original_pil = box_image(image, [bbox])
+                trace_html.append("<p>Query region on original image:</p>")
+                trace_html.append(html_embed_image(boxed_original_pil, 300))
+                trace_html.append("<p>Masked & Cropped region (for VLM):</p>")
+                trace_html.append(html_embed_image(img_for_vqa_display, 200))
+
+            else:
+                print(f"Warning: Invalid bbox for VQA crop: {bbox}. Using full image for display.")
+                img_for_vqa_display = image
+                trace_html.append(f"<p>VQA (holistic due to invalid crop {bbox}): {question}</p>")
+                trace_html.append(html_embed_image(image, 300))
+                is_holistic = True
+        except (ValueError, TypeError):
+            print(f"Warning: Invalid bbox format for VQA crop: {bbox}. Using full image for display.")
+            img_for_vqa_display = image
+            trace_html.append(f"<p>VQA (holistic due to invalid bbox format {bbox}): {question}</p>")
+            trace_html.append(html_embed_image(image, 300))
+            is_holistic = True
+
+    answer = _vqa_predict(img_for_vqa_display, remake_query(question), holistic=is_holistic)
+    # trace_html.extend(vqa_predict_trace) 
+    trace_html.append(f"<p>VQA Final Answer (from _vqa_predict): {answer}</p>")
+
+    return answer.lower(), trace_html
+    
+def _vqa_predict2(img, depth, masks, question):
+    global gemini_generator
     """VQA prediction using SpatialRGPT model"""
     try:
         # Format the question with VQA prompt template
@@ -1469,7 +1822,7 @@ def _vqa_predict(img, depth, masks, question):
             # img.save(temp_path, format=img.format)
             
             # Call InternVL3 generate function with image path
-        output, _ = generate_spatial_vlm_response(
+        output, _ = gemini_generator.generate(
             prompt=full_prompt,
             rgb_image=img,  # Pass image path to multimodal handler
             depth_image=depth,
@@ -1503,7 +1856,7 @@ def invert_query(query):
     # Replace all <regionN> tags with <mask>
     return re.sub(r'<region\d+>', '<mask>', query)
 
-def vqa(image, depth, question, objects): 
+def vqa2(image, depth, question, objects): 
     trace_html = []
 
     # is_holistic = False
@@ -1586,87 +1939,88 @@ def same_object(image, bbox1, bbox2):
     trace_html.append(f"<p>IoU: {iou_val:.3f}, Same object: {answer}</p>")
     return answer, trace_html
 
+# MODIFIED: find_overlapping_regions to add HTML tracing
 def find_overlapping_regions(parent_region: DetectedObject, 
-                            countable_regions: List[DetectedObject]) -> List[int]:
+                            countable_regions: List[DetectedObject]) -> Tuple[List[int], List[str]]:
     """
-    Find regions that overlap with parent region within cropped area
+    Find regions that overlap with parent region within cropped area.
+    Now returns a tuple with the result and an HTML trace.
     
     Args:
         parent_region: parent region object
         countable_regions: List of region objects that can be counted
         
     Returns:
-        List of region_index (int) that meet threshold
+        Tuple[List[int], List[str]]: (List of overlapping region indices, html_trace)
     """
+    trace_html = []
+    trace_html.append(f"<h4>Find Overlapping Regions</h4>")
+    trace_html.append(f"<p>Parent region: '<b>{parent_region.description}</b>'</p>")
+    trace_html.append(f"<p>Checking against <b>{len(countable_regions)}</b> candidate regions.</p>")
+    
     padding = 20
     overlap_threshold = 0.2
-    # Extract bounding box coordinates
     parent_mask = parent_region.segmentation_mask_2d
     x, y, w, h = parent_region.bounding_box_2d
     
-    # Add padding
     x_min = max(0, int(x - padding))
     y_min = max(0, int(y - padding))
     x_max = min(parent_mask.shape[1], int(x + w + padding))
     y_max = min(parent_mask.shape[0], int(y + h + padding))
-    # x_min, y_min, x_max, y_max = crop_bbox
     
     overlapping_regions = []
 
     for region in countable_regions:
         if region.description == parent_region.description:
-            continue  # Skip parent region itself
+            continue
         
         region_mask = region.segmentation_mask_2d
-        region_bbox = region.bounding_box_2d
         
-        # Quick bbox intersection check for optimization
-        # rx, ry, rw, rh = region_bbox
-        # if (rx + rw < x_min or rx > x_max or 
-        #     ry + rh < y_min or ry > y_max):
-        #     continue  # No bbox intersection
-        
-        # Check pixel-level overlap within cropped area
         crop_parent = parent_mask[y_min:y_max, x_min:x_max]
         crop_region = region_mask[y_min:y_max, x_min:x_max]
         
-        # Calculate overlap
         overlap = np.logical_and(crop_parent, crop_region)
         overlap_area = np.sum(overlap)
         
         if overlap_area > 0:
-            # Calculate overlap percentage relative to the child region
             region_area = np.sum(crop_region)
             overlap_percentage = overlap_area / region_area if region_area > 0 else 0
             
-            # Check if overlap meets threshold
             if overlap_percentage >= overlap_threshold:
                 match = re.search(r'\d+', region.description)
                 if match:
                     number = int(match.group())
-                overlapping_regions.append(number)
+                    overlapping_regions.append(number)
     
-    return overlapping_regions
+    trace_html.append(f"<p>Result: Found <b>{len(overlapping_regions)}</b> overlapping regions with indices: <b>{overlapping_regions}</b></p>")
+    return overlapping_regions, trace_html
 
-def calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject):
+# MODIFIED: calculate_3d_distance to add HTML tracing
+def calculate_3d_distance(obj1: DetectedObject, obj2: DetectedObject) -> Tuple[float, List[str]]:
     """
-    Calculates the center-to-center distance between two 3D objects using their oriented bounding boxes.
+    Calculates the center-to-center distance between two 3D objects and returns it
+    with an HTML trace.
 
     Args:
-        obj1 (DetectedObject): The first detected object, containing a 3D oriented bounding box.
-        obj2 (DetectedObject): The second detected object, containing a 3D oriented bounding box.
+        obj1 (DetectedObject): The first detected object.
+        obj2 (DetectedObject): The second detected object.
 
     Returns:
-        float: (meters) Euclidean distance between the centers of the two objects.
+        tuple: (adjusted_distance, html_trace)
     """
-    # Get the center of each oriented bounding box
+    trace_html = []
     center1 = obj1.bounding_box_3d_oriented.get_center()
     center2 = obj2.bounding_box_3d_oriented.get_center()
-    
-    # Calculate Euclidean distance between centers
     distance = np.linalg.norm(center1 - center2)
-    
-    return distance + distance*0.22
+    adjusted_distance = distance + distance * 0.22
+
+    trace_html.append(f"<h4>Calculate 3D Distance</h4>")
+    trace_html.append(f"<p>Object 1: '<b>{obj1.description}</b>' (Center: {np.round(center1, 3).tolist()})</p>")
+    trace_html.append(f"<p>Object 2: '<b>{obj2.description}</b>' (Center: {np.round(center2, 3).tolist()})</p>")
+    trace_html.append(f"<p>Euclidean distance: <b>{distance:.4f}</b> meters</p>")
+    trace_html.append(f"<p>Adjusted distance (+22%): <b>{adjusted_distance:.4f}</b> meters</p>")
+
+    return adjusted_distance, trace_html
 
 def get_2D_object_size(image, bbox): 
     if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4 and all(isinstance(c, (int, float)) for c in bbox)):
@@ -1684,153 +2038,170 @@ def get_2D_object_size(image, bbox):
     trace_html.append(f"<p>Width: {width}, Height: {height}</p>")
     return (width, height), trace_html
 
+# Add this near your other prompt definitions
+PROGRAM_CORRECTION_PROMPT = """
+You are an expert Python debugger. The following Python code, designed to run in a special environment with predefined tools, failed during execution.
+
+Your task is to analyze the error traceback and the faulty code, and provide a corrected version of **only the solution program part**.
+
+**Context:**
+- The program has access to a pre-defined API.
+- The program's goal is to answer a question about an image.
+
+**Available API (for context on what functions can be called):**
+{api_code}
+
+**Faulty Program Code:**
+{program_code}
+
+**Execution Error and Traceback:**
+{traceback}
+
+**Instructions:**
+1.  Carefully read the traceback to understand the error (e.g., `NameError`, `TypeError`, `IndexError`).
+2.  Examine the provided code to locate the source of the error.
+3.  Rewrite the program to fix the bug. Do NOT change the overall logic unless it's necessary to fix the error.
+4.  Ensure the corrected code still aims to solve the original problem.
+5.  Wrap the corrected and complete Python code block inside `<program></program>` tags.
+6.  Do not add any explanations, apologies, or text outside the code block.
+
+**Corrected Program:**
+"""
+
 def execute_program(program, image, depth, detected_objects, api):
-    wrapped_program = wrap_solution_code(program)
+    """
+    Executes the generated program with a retry-and-correct mechanism.
+
+    If the program fails, it captures the error, sends the faulty code and error
+    to a powerful LLM (Gemini) for a fix, and retries with the corrected code.
+    """
+    global gemini_generator # Use the globally initialized Gemini generator
+
+    max_retries = 2  # Allow up to 2 correction attempts (3 total executions)
+    current_program_code = program
+    full_html_trace = []
+
+    # Prepare the static parts of the executable code once
     header_lines = [
-    "import math",
-    "from typing import Tuple, List, Dict, Optional",
-    "from PIL import Image as PILImage, ImageDraw",  # PILImage will be from inject_globals
-    "import numpy as np",  # np from inject_globals
-    "import open3d as o3d",  # o3d from inject_globals
-    "import io, base64, sys, os, re, tempfile, json, time, torch",
-    "from pathlib import Path",
-    "import PIL",
-    ""
-  ]
-    header_str = "\n".join(line for line in header_lines) + '\n'
-
-
-    executable_program = header_str + api + wrapped_program
-
-    # Store program lines in a list for reference
-    program_lines = executable_program.split("\n")
-
-    # Create a function to get line text from our stored program
-    def get_line(line_no):
-        # Adjust line number to 0-based index
-        idx = line_no - 1
-        if 0 <= idx < len(program_lines):
-            return program_lines[idx]
-        return ""
-
-    # parse API methods
+        "import math", "from typing import Tuple, List, Dict, Optional",
+        "from PIL import Image as PILImage, ImageDraw", "import numpy as np",
+        "import open3d as o3d", "import io, base64, sys, os, re, tempfile, json, time, torch",
+        "from pathlib import Path", "import PIL", ""
+    ]
+    header_str = "\n".join(header_lines) + '\n'
     api_methods = re.findall(r"def (\w+)\s*\(.*\):", api)
 
-    # Create a trace string to record execution
-    html_trace = []
+    for attempt in range(max_retries + 1):
+        full_html_trace.append(f"<h2>Execution Attempt {attempt + 1}</h2>")
+        if attempt > 0:
+            full_html_trace.append("<h4>Corrected Program Code:</h4>")
+            full_html_trace.append(f"<pre style='background-color:#f0f0f0; border:1px solid #ccc; padding:10px; border-radius:5px;'><code>{current_program_code}</code></pre>")
 
-    # Create namespace for execution
-    def _traced_loc(image, object_prompt):
-        result, html = loc(image, object_prompt)
-        html_trace.extend(html)
-        return result
+        wrapped_program = wrap_solution_code(current_program_code)
+        executable_program = header_str + api + wrapped_program
 
-    def _traced_retrieve_objects(detected_objects, object_prompt):
-        result, html = retrieve_objects(detected_objects, object_prompt)
-        html_trace.extend(html)
-        return result
+        program_lines = executable_program.split("\n")
+        def get_line(line_no):
+            idx = line_no - 1
+            return program_lines[idx] if 0 <= idx < len(program_lines) else ""
 
-    def _traced_extract_2d_bounding_box(detected_object):
-        result, html = extract_2d_bounding_box(detected_object)
-        html_trace.extend(html)
-        return result
+        attempt_trace = []
+        def trace_lines(frame, event, arg):
+            if event == "line":
+                method_name = frame.f_code.co_name
+                if method_name == "solution_program" or method_name in api_methods:
+                    line_no = frame.f_lineno
+                    line = get_line(line_no).strip()
+                    if len(line) > 0:
+                        attempt_trace.append(f"<p><code>[{method_name}] Line {line_no}: {line}</code></p>")
+            return trace_lines
         
-    def _traced_extract_3d_bounding_box(detected_object):
-        result, html = extract_3d_bounding_box(detected_object)
-        html_trace.extend(html)
-        return result
+        # Define the namespace for this attempt
+        namespace = {
+            "DetectedObject": DetectedObject, "image": image, "detected_objects": detected_objects, "depth": depth,
+            # Traced functions for logging
+            "loc": lambda *args, **kwargs: _trace_and_run(loc, attempt_trace, *args, **kwargs),
+            "retrieve_objects": lambda *args, **kwargs: _trace_and_run(retrieve_objects, attempt_trace, *args, **kwargs),
+            "vqa": lambda *args, **kwargs: _trace_and_run(vqa, attempt_trace, *args, **kwargs),
+            "extract_2d_bounding_box": lambda *args, **kwargs: _trace_and_run(extract_2d_bounding_box, attempt_trace, *args, **kwargs),
+            "extract_3d_bounding_box": lambda *args, **kwargs: _trace_and_run(extract_3d_bounding_box, attempt_trace, *args, **kwargs),
+            "get_3D_object_size": lambda *args, **kwargs: _trace_and_run(get_3D_object_size, attempt_trace, *args, **kwargs),
+            "find_overlapping_regions": lambda *args, **kwargs: _trace_and_run(find_overlapping_regions, attempt_trace, *args, **kwargs),
+            "calculate_3d_distance": lambda *args, **kwargs: _trace_and_run(calculate_3d_distance, attempt_trace, *args, **kwargs),
+            "is_similar_text": lambda *args, **kwargs: _trace_and_run(is_similar_text, attempt_trace, *args, **kwargs),
+        }
 
-    def _traced_get_3D_object_size(detected_object):
-        result, html = get_3D_object_size(detected_object)
-        html_trace.extend(html)
-        return result
+        sys.settrace(trace_lines)
+        try:
+            # Execute the program
+            exec(executable_program, namespace)
+            sys.settrace(None) # Crucial to turn off tracing on success
 
-    def _traced_vqa(image, depth, question, objects):
-        result, html = vqa(image, depth, question, objects)
-        html_trace.extend(html)
-        return result
+            final_result = namespace.get("final_result", "Error: final_result not found.")
+            full_html_trace.append("<h3><span style='color:green;'>Success</span></h3>")
+            full_html_trace.extend(attempt_trace)
+            
+            print(f"--- Program execution successful on attempt {attempt + 1} ---")
+            print('-----LUCKY LUCKY-----'*10)
+            print(final_result)
+            print('-----LUCKY LUCKY-----'*10)
+            
+            return final_result, "".join(full_html_trace)
 
-    def _traced_depth(image, bbox):
-        result, html = depth(image, bbox)
-        html_trace.extend(html)
-        return result
+        except Exception:
+            sys.settrace(None) # Turn off tracing on failure
+            traceback_str = traceback.format_exc()
+            
+            full_html_trace.append("<h3><span style='color:red;'>Failed</span></h3>")
+            full_html_trace.extend(attempt_trace)
+            full_html_trace.append(f"<h4>Error Traceback:</h4><pre style='background-color:#ffebeb; color:red; border:1px solid red; padding:10px; border-radius:5px;'>{traceback_str}</pre>")
 
-    def _traced_get_2D_object_size(image, bbox):
-        result, html = get_2D_object_size(image, bbox)
-        html_trace.extend(html)
-        return result
+            print(f"--- Program execution failed on attempt {attempt + 1} ---")
+            print(traceback_str)
 
-    # def _traced_same_object(image, bbox1, bbox2):
-    #     result, html = same_object(image, bbox1, bbox2)
-    #     html_trace.extend(html)
-    #     return result
+            if attempt >= max_retries:
+                full_html_trace.append("<h3>Max retries reached. Aborting.</h3>")
+                error_msg = f"Execution failed after {max_retries + 1} attempts. See trace for details."
+                return error_msg, "".join(full_html_trace)
 
-    def _traced_find_overlapping_regions(parent_region, 
-                            countable_regions):
-        result = find_overlapping_regions(parent_region, countable_regions)
-        html_trace.extend([])
-        return result
+            # --- Correction Step ---
+            print("--- Requesting code correction from Gemini... ---")
+            full_html_trace.append("<h4>Requesting Correction from LLM:</h4>")
 
-    def _traced_calculate_3d_distance(obj1, obj2):
-        result = calculate_3d_distance(obj1, obj2)
-        html_trace.extend([])
-        return result
-    
-    def _traced_is_similar_text(text1, text2):
-        result = is_similar_text(text1, text2)
-        return result
+            # Use the new prompt for correction
+            correction_prompt = PROGRAM_CORRECTION_PROMPT.format(
+                api_code=api,
+                program_code=current_program_code,
+                traceback=traceback_str
+            )
 
-    # Create a custom trace function to track line execution
-    def trace_lines(frame, event, arg):
-        if event == "line":
-            method_name = frame.f_code.co_name
-            if method_name == "solution_program" or method_name in api_methods:
-                line_no = frame.f_lineno
-                line = get_line(line_no).strip()
-                if len(line) > 0:
-                    html_trace.append(
-                        f"<p><code>[{method_name}] Line {line_no}: {line}</code></p>"
-                    )
-        return trace_lines
+            try:
+                # Call Gemini to get the fix
+                corrected_output, _ = gemini_generator.generate(prompt=correction_prompt, temperature=0.2)
+                
+                # Parse the corrected program
+                program_match = re.search(r"<program>(.*?)</program>", corrected_output, re.DOTALL)
+                if program_match:
+                    current_program_code = program_match.group(1).strip()
+                    print("--- Received corrected code. Retrying... ---")
+                else:
+                    print("--- LLM failed to provide a valid correction. Retrying with original code... ---")
+                    full_html_trace.append("<p><strong>LLM correction failed (no &lt;program&gt; tag). Retrying with previous code.</strong></p>")
+                    # Loop will continue, but the code hasn't changed.
+            except Exception as llm_e:
+                print(f"--- LLM call for correction failed: {llm_e}. Retrying with original code... ---")
+                full_html_trace.append(f"<p><strong>LLM correction call failed: {llm_e}. Retrying with previous code.</strong></p>")
 
-    namespace = {
-        "DetectedObject": DetectedObject,
-        "loc": _traced_loc,
-        "retrieve_objects": _traced_retrieve_objects,
-        "vqa": _traced_vqa,
-        "depth": depth,
-        "image": image,
-        "detected_objects": detected_objects,
-        "extract_2d_bounding_box": _traced_extract_2d_bounding_box,
-        "extract_3d_bounding_box": _traced_extract_3d_bounding_box,
-        "get_3D_object_size": _traced_get_3D_object_size,
-        # "get_2D_object_size": _traced_get_2D_object_size,
-        # "same_object": _traced_same_object,
-        "find_overlapping_regions": _traced_find_overlapping_regions,
-        "calculate_3d_distance": _traced_calculate_3d_distance,
-        "is_similar_text": _traced_is_similar_text,
-    }
+    # This part should ideally not be reached, but serves as a fallback.
+    return "Execution failed after all retries.", "".join(full_html_trace)
 
-    # Set up the trace function
-    sys.settrace(trace_lines)
-
-    try:
-        # Execute the program
-        exec(executable_program, namespace)
-
-    finally:
-        # Disable tracing
-        sys.settrace(None)
-
-    final_result = namespace["final_result"]
-
-    print('-----LUCKY LUCKY-----'*10)
-    print(final_result)
-    print('-----LUCKY LUCKY-----'*10)
-
-    # Return both the text trace and HTML trace
-    return final_result, "\n".join(html_trace)
-
+def _trace_and_run(func, trace_list, *args, **kwargs):
+    """Helper to run a function and capture its HTML trace."""
+    # Note: This assumes the tool functions (loc, vqa, etc.) return a tuple of (result, html_trace)
+    result, html = func(*args, **kwargs)
+    if html: # In case a tool has no trace
+        trace_list.extend(html)
+    return result
 
 def display_result(final_result, image_pil, question, ground_truth): 
     result_html_parts = []
@@ -1905,7 +2276,7 @@ def generate_description_functions(query: str, objects: list[str]):
       function_code = (
         f"def {func_name}(image, detected_object):\n"
         f"  # Check if {obj} is {desc}\n"
-        f"  return vqa(image, depth, 'Is {obj} <region0> {desc}?', [detected_object])\n"
+        f"  return vqa(image, 'Is {obj} <region0> {desc}?', detected_object)\n"
       )
       function_lines.append(function_code)
 
@@ -1997,7 +2368,7 @@ Provide 3-5 clear action steps for spatial logic and decision-making.
     {
       "object": "transporter",
       "adjective": "empty",
-      "vqa_call": "vqa(image, depth, 'Is this <mask_tag> (transporter) empty?', detected_objects[0])"
+      "vqa_call": "vqa(image, 'Is this <mask_tag> (transporter) empty?', detected_objects[0])"
     }
   ],
   "spatial_instructions": [
@@ -2029,7 +2400,7 @@ Provide 3-5 clear action steps for spatial logic and decision-making.
     {
       "object": "object_name",
       "adjective": "property",
-      "vqa_call": "vqa(image, depth, 'Is this <mask_tag> (object) [property]?', [reference])"
+      "vqa_call": "vqa(image, 'Is this <mask_tag> (object) [property]?', reference)"
     }
   ],
   "spatial_instructions": [
@@ -2040,11 +2411,11 @@ Provide 3-5 clear action steps for spatial logic and decision-making.
 Input:
 
 """
-    print(f"Calling SpatialRGPT with query: {query}")
-    output_text, _ = generate_spatial_vlm_response(
+    global gemini_generator
+    print(f"Calling Gemini with query: {query}")
+    output_text, _ = gemini_generator.generate(
     prompt=prompt + query,
-    # rgb_image=img,
-    temperature=0.1)
+    )
 
     # output_text = generate(prompt=prompt + query, enable_thinking=False, temperature=0.2)[0]
 
@@ -2062,7 +2433,7 @@ You are a JSON repair assistant. You will be given a possibly malformed or incon
     {
       "object": "string (name of object)",
       "adjective": "string (descriptor like 'empty')",
-      "vqa_call": "string (function call of form: vqa(image, depth, 'Is this <mask> (object) adjective?', [detected_objects[i]]))"
+      "vqa_call": "string (function call of form: vqa(image, 'Is this <mask> (object) adjective?', detected_objects[i]))"
     },
     ...
   ],
@@ -2080,7 +2451,7 @@ Your task is to:
 3. Ensure all `vqa_call` strings follow this template:
 
    ```
-   vqa(image, depth, 'Is this <region0> (object) adjective?', [detected_objects[i]])
+   vqa(image, 'Is this <region0> (object) adjective?', detected_objects[i])
    ```
 
    Replace `object`, `adjective`, and `i` with the corresponding values from the JSON entry.
@@ -2854,7 +3225,7 @@ def test_individual_api_function(
         # html_trace.extend(html)
         return result
 
-    def _traced_vqa(image, depth, question, objects):
+    def _traced_vqa(image, question, object):
         return 'result'
 
     def _traced_get_2D_object_size(image, bbox):
@@ -2867,19 +3238,16 @@ def test_individual_api_function(
     #     html_trace.extend(html)
     #     return result
 
-    def _traced_find_overlapping_regions(parent_region, 
-                            countable_regions):
-        result = find_overlapping_regions(parent_region, countable_regions)
-        # html_trace.extend([])
+    def _traced_find_overlapping_regions(parent_region, countable_regions):
+        result, _ = find_overlapping_regions(parent_region, countable_regions)
         return result
 
     def _traced_calculate_3d_distance(obj1, obj2):
-        result = calculate_3d_distance(obj1, obj2)
-        # html_trace.extend([])
+        result, _ = calculate_3d_distance(obj1, obj2)
         return result
     
     def _traced_is_similar_text(text1, text2):
-        result = is_similar_text(text1, text2)
+        result, _ = is_similar_text(text1, text2)
         return result
 
     globals_to_inject = {
@@ -2893,7 +3261,7 @@ def test_individual_api_function(
         # Models and device (must be initialized and accessible in current scope)
         # "grounding_dino": grounding_dino, # Global from initialize_modules
         "unik3d_model": unik3d_model,     # Global from initialize_modules
-        "spatialrgpt_generator": spatialrgpt_generator, # Global from initialize_modules
+        "gemini_generator": gemini_generator, # Global from initialize_modules
         "qwen_generator": qwen_generator, # Global, if needed by any tool directly
         "embedding_model": embedding_model, # Global from retrieve_objects context
         "device": device,                 # Global from initialize_modules
@@ -3069,7 +3437,14 @@ class DetectedObject:
     # Write the Function Under Test
     script_content.append(f"\n# --- Function under test: {method_name_under_test} ---")
     script_content.append(f"{current_signature_code}")
-    indented_impl_body = "\n".join(["    " + line for line in current_implementation_code.strip().split("\n")])
+
+    # Use the robust helper to correctly normalize and indent the implementation
+    indented_impl_body = normalize_indentation(current_implementation_code)
+
+    # Safety check: If the implementation was empty, provide a 'pass' statement
+    if not indented_impl_body.strip():
+        indented_impl_body = "    pass"
+
     script_content.append(f"{indented_impl_body}\n")
     script_content.append("# --- End Function under test ---\n")
 
@@ -3092,7 +3467,7 @@ class DetectedObject:
              # Create a specific mock string in globals if needed, else literal
             globals_to_inject[f"mock_str_arg_for_{arg_name}"] = f"mock_prompt_for_{arg_name}"
             arg_name_to_global_var_name[arg_name] = f"mock_str_arg_for_{arg_name}"
-        elif "list[detectedobject]" in normalized_arg_type or "list[ detectedobject]" in normalized_arg_type :
+        elif "list[detectedobject]" in normalized_arg_type or "list[detectedobject]" in normalized_arg_type :
             arg_name_to_global_var_name[arg_name] = "detected_objects" # We put _mock_detected_objects_list as "detected_objects"
         elif "list" in normalized_arg_type and ("int" in normalized_arg_type or "float" in normalized_arg_type): # bbox list
             globals_to_inject[f"mock_bbox_arg_for_{arg_name}"] = list(_mock_detected_object_1.bounding_box_2d) # Example bbox
@@ -3157,10 +3532,20 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
             if unknown_name not in method_names_ordered:
                 method_names_ordered.append(unknown_name)
 
+    # --- IMPROVEMENT 1: Pre-calculate the holistic API context (from api_agent_2) ---
+    # This provides the LLM with the full context of all intended APIs from the start.
+    all_gen_api_signatures_and_docs = []
+    for header in all_method_headers:
+        all_gen_api_signatures_and_docs.append({
+            "name": header["method_name"],
+            "text": header["docstring"] + "\n" + header["signature"]
+        })
+    # --- END IMPROVEMENT 1 ---
+
     processed_apis = [] # Stores dicts: {method_name, docstring, signature, implementation, messages, status}
     error_counts = {name: 0 for name in method_names_ordered}
     llm_messages_history = {name: [] for name in method_names_ordered}
-    last_attempted_implementations = {name: None for name in method_names_ordered} # Store last valid code before test
+    last_attempted_implementations = {name: None for name in method_names_ordered}
     MAX_RETRIES_PER_FUNCTION = 3
     MAX_DEPENDENCY_DEPTH = 5
 
@@ -3170,7 +3555,7 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
     os.makedirs(temp_test_base_dir, exist_ok=True)
 
     processing_queue = list(method_names_ordered)
-    
+
     def get_header_info(name):
         for header in all_method_headers:
             if header["method_name"] == name:
@@ -3195,36 +3580,34 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
 
         if error_counts[current_method_name] >= MAX_RETRIES_PER_FUNCTION:
             print(f"Skipping implementation for '{current_method_name}' after {MAX_RETRIES_PER_FUNCTION} retries.")
-            
             final_impl_to_use = "    pass # Max retries reached, no prior valid implementation found"
             current_status = "failed_max_retries_placeholder"
 
             if last_attempted_implementations[current_method_name] is not None:
                 print(f"Keeping last attempted (but failed) implementation for {current_method_name}.")
                 last_failed_impl_body = last_attempted_implementations[current_method_name]
-                # Ensure it's just the body and correctly indented
-                final_impl_to_use = "\n".join(["    " + line for line in last_failed_impl_body.strip().split("\n")])
+                
+                # --- IMPROVEMENT 2: Use robust implementation formatting (from api_agent_2) ---
+                implementation_lines = [line.strip() for line in last_failed_impl_body.split("\n")]
+                final_impl_to_use = "\n".join(["    " + line for line in implementation_lines if line])
+                # --- END IMPROVEMENT 2 ---
+                
                 current_status = "failed_max_retries_kept_last"
-            
+
             processed_apis.append({
-                "method_name": current_method_name,
-                "docstring": header_info["docstring"],
-                "signature": header_info["signature"],
-                "implementation": final_impl_to_use,
-                "messages": llm_messages_history[current_method_name],
-                "status": current_status
+                "method_name": current_method_name, "docstring": header_info["docstring"], "signature": header_info["signature"],
+                "implementation": final_impl_to_use, "messages": llm_messages_history[current_method_name], "status": current_status
             })
             idx += 1
             continue
 
-        context_generated_signatures = []
-        for h in all_method_headers:
-            if h["method_name"] == current_method_name:
-                continue
-            if error_counts.get(h["method_name"], 0) < MAX_RETRIES_PER_FUNCTION:
-                 context_generated_signatures.append(h["docstring"] + "\n" + h["signature"])
-
-        context_signatures_text = "\n\n".join(context_generated_signatures)
+        # --- IMPROVEMENT 1 (continued): Use the pre-calculated context for the prompt ---
+        # Filter out the current method from the context to avoid self-reference in the prompt.
+        context_signatures = [
+            item['text'] for item in all_gen_api_signatures_and_docs if item['name'] != current_method_name
+        ]
+        context_signatures_text = "\n\n".join(context_signatures)
+        # --- END IMPROVEMENT 1 ---
 
         current_prompt_text = API_PROMPT.format(
             predef_signatures=predef_signatures,
@@ -3244,7 +3627,7 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
         if not isinstance(output_text, str) or "Error:" in output_text:
             print(f"API Agent LLM Error for {current_method_name}: {output_text}. Retrying...")
             error_counts[current_method_name] += 1
-            llm_messages_history[current_method_name].append({"role": "user", "content": f"The generation failed or returned an error. Please try again, focusing on the core task. The error: {test_result['error']}"})
+            llm_messages_history[current_method_name].append({"role": "user", "content": f"The generation failed or returned an error. Please try again, focusing on the core task."})
             continue
 
         implementation_match = re.search(r"<implementation>(.*?)</implementation>", output_text, re.DOTALL)
@@ -3259,131 +3642,92 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
         if lines and lines[0].strip().startswith("def "):
             raw_implementation_body = "\n".join(lines[1:])
         
-        # Store this successfully parsed implementation body *before* testing
         last_attempted_implementations[current_method_name] = raw_implementation_body
 
         api_info_for_test = {
-            "method_name": current_method_name,
-            "docstring": header_info["docstring"],
-            "signature": header_info["signature"],
-            "implementation": raw_implementation_body, # Pass unindented body for testing
-            "messages": llm_messages_history[current_method_name]
+            "method_name": current_method_name, "docstring": header_info["docstring"], "signature": header_info["signature"],
+            "implementation": raw_implementation_body, "messages": llm_messages_history[current_method_name]
         }
-
-        # print('----Testing GenFunc----'*10)
-        # print(api_info_for_test)
-        # print('----Testing GenFunc----'*10)
 
         test_result = test_individual_api_function(
             api_info_under_test=api_info_for_test,
             predef_signatures_text=predef_signatures,
-            successfully_implemented_apis=[api for api in processed_apis if api["status"] == "success"], # Pass only truly successful ones
+            successfully_implemented_apis=[api for api in processed_apis if api["status"] == "success"],
             temp_dir_for_testing=temp_test_base_dir
         )
 
-        # Inside api_agent, within the `while idx < len(processing_queue):` loop:
-
-        # ... (after LLM generation and parsing `raw_implementation_body`) ...
-        # ... (after `test_individual_api_function` call) ...
-
         if test_result["error"]:
             print(f"Test failed for {current_method_name}: {test_result['error']}")
-            
-            was_deferred_for_dependency = False # Flag to indicate if we are deferring current_method_name
-
-            # --- Dependency Check and Re-queueing Logic ---
-            undefined_method_match = re.search(r"name '(\w+)' is not defined", str(test_result["error"]).lower()) # Use str() for safety
+            was_deferred_for_dependency = False
+            undefined_method_match = re.search(r"name '(\w+)' is not defined", str(test_result["error"]).lower())
             if undefined_method_match:
                 undefined_method_name = undefined_method_match.group(1)
-                
-                # Check if it's one of OUR generated methods and not the current one
                 if undefined_method_name in method_names_ordered and undefined_method_name != current_method_name:
-                    # Check if this dependency is not yet successfully processed
                     is_unresolved_dependency = not any(
-                        api_item["method_name"] == undefined_method_name and api_item["status"] == "success"
-                        for api_item in processed_apis
+                        api["method_name"] == undefined_method_name and api["status"] == "success" for api in processed_apis
                     )
-
                     if is_unresolved_dependency:
                         print(f"Dependency '{undefined_method_name}' for '{current_method_name}' is unresolved. Attempting to prioritize it.")
-                        
-                        # Attempt to re-queue the dependency
-                        # This logic needs to be robust. We want to move `undefined_method_name`
-                        # to be processed before `current_method_name` if it's currently scheduled later.
                         try:
-                            current_idx_in_queue = processing_queue.index(current_method_name) # Should be `idx`
-                            
+                            current_idx_in_queue = processing_queue.index(current_method_name)
                             if undefined_method_name in processing_queue:
                                 dep_idx_in_queue = processing_queue.index(undefined_method_name)
-                                
-                                if dep_idx_in_queue > current_idx_in_queue: # Dependency is scheduled AFTER current method
-                                    if processing_queue.count(undefined_method_name) < MAX_DEPENDENCY_DEPTH: # Check before modifying
+                                if dep_idx_in_queue > current_idx_in_queue:
+                                    if processing_queue.count(undefined_method_name) < MAX_DEPENDENCY_DEPTH:
                                         processing_queue.pop(dep_idx_in_queue)
                                         processing_queue.insert(current_idx_in_queue, undefined_method_name)
-                                        print(f"Prioritized '{undefined_method_name}' before '{current_method_name}'. '{current_method_name}' will be deferred.")
+                                        print(f"Prioritized '{undefined_method_name}'. '{current_method_name}' will be deferred.")
                                         was_deferred_for_dependency = True
                                     else:
-                                        print(f"Max dependency depth for '{undefined_method_name}' reached. Cannot prioritize further for '{current_method_name}'.")
-                                elif dep_idx_in_queue < current_idx_in_queue:
-                                     print(f"Dependency '{undefined_method_name}' is already scheduled before '{current_method_name}' but seems to have failed or is still pending. '{current_method_name}' will be treated as having an error.")
-                                # If dep_idx_in_queue == current_idx_in_queue, something is wrong, treat as error for current.
-                            
-                            elif processing_queue.count(undefined_method_name) < MAX_DEPENDENCY_DEPTH: # Dependency not in queue, but known
+                                        print(f"Max dependency depth for '{undefined_method_name}' reached. Cannot prioritize further.")
+                                else:
+                                     print(f"Dependency '{undefined_method_name}' is already scheduled before '{current_method_name}' but has not succeeded yet.")
+                            elif processing_queue.count(undefined_method_name) < MAX_DEPENDENCY_DEPTH:
                                 processing_queue.insert(current_idx_in_queue, undefined_method_name)
-                                print(f"Added missing dependency '{undefined_method_name}' to queue before '{current_method_name}'. '{current_method_name}' will be deferred.")
+                                print(f"Added missing dependency '{undefined_method_name}' to queue. '{current_method_name}' will be deferred.")
                                 was_deferred_for_dependency = True
                             else:
-                                print(f"Max dependency depth for '{undefined_method_name}' (not in queue) reached. Cannot add for '{current_method_name}'.")
-
+                                print(f"Max dependency depth for '{undefined_method_name}' reached. Cannot add to queue.")
                         except ValueError:
-                            print(f"Error: '{current_method_name}' or '{undefined_method_name}' not found in queue during dependency handling. This should not happen.")
-            
-            # --- End Dependency Check and Re-queueing Logic ---
+                            print(f"Error: Could not find method in queue during dependency handling.")
 
             if was_deferred_for_dependency:
-                # If deferred, we don't count this as an error for current_method_name's implementation.
-                # We also inform the LLM about the deferral so it has context if/when it retries current_method_name later.
                 llm_messages_history[current_method_name].append({
                     "role": "user",
-                    "content": (f"Note: Your previous implementation for '{current_method_name}' could not be tested "
-                                f"because it depends on '{undefined_method_name}', which needs to be implemented first. "
-                                f"I will attempt to implement '{undefined_method_name}' and then retry '{current_method_name}'. "
-                                "No action needed from you on this function for now unless I provide a specific error for it later.")
+                    "content": (f"Note: Your implementation for '{current_method_name}' failed because it depends on '{undefined_method_name}', which is not yet available. "
+                                f"I will implement '{undefined_method_name}' first and then return to this function. No action needed.")
                 })
-                # The `continue` at the end of this `if test_result["error"]:` block will cause the loop
-                # to re-process `processing_queue[idx]`, which might now be the prioritized dependency.
             else:
-                # This is an error in current_method_name's own logic, or a dependency issue that couldn't be resolved by re-queueing.
                 error_counts[current_method_name] += 1
                 feedback_to_llm = (
                     f"Your implementation for '{current_method_name}' failed testing with the following error:\n{test_result['error']}\n"
                     f"Stacktrace (if available):\n{test_result['stacktrace']}\n"
-                    "Please analyze the error and provide a corrected full implementation for "
-                    f"'{current_method_name}' within <implementation></implementation> tags."
+                    f"Please analyze the error and provide a corrected full implementation for '{current_method_name}' within <implementation></implementation> tags."
                 )
                 llm_messages_history[current_method_name].append({"role": "user", "content": feedback_to_llm})
             
-            continue # Crucial: After any error (deferral or actual), restart the loop to process `processing_queue[idx]`.
-                     # `idx` itself is not incremented here, so current_method_name (or its prioritized dependency) is retried.
+            continue
 
-        else: # Test was successful for current_method_name
+        else: # Test was successful
             print(f"Successfully implemented and tested: {current_method_name}")
-            indented_body = "\n".join(["    " + line for line in raw_implementation_body.strip().split("\n")])
+
+            # --- IMPROVEMENT 2: Use robust implementation formatting (from api_agent_2) ---
+            implementation_lines = [line.strip() for line in raw_implementation_body.split("\n")]
+            indented_body = "\n".join(["    " + line for line in implementation_lines if line])
+            if not indented_body: # Handle cases where implementation is empty after stripping
+                indented_body = "    pass"
+            # --- END IMPROVEMENT 2 ---
+
             processed_apis.append({
-                "method_name": current_method_name,
-                "docstring": header_info["docstring"],
-                "signature": header_info["signature"],
-                "implementation": indented_body,
-                "messages": llm_messages_history[current_method_name],
-                "status": "success"
+                "method_name": current_method_name, "docstring": header_info["docstring"], "signature": header_info["signature"],
+                "implementation": indented_body, "messages": llm_messages_history[current_method_name], "status": "success"
             })
-            idx += 1 # IMPORTANT: Only increment idx on successful implementation and test.
+            idx += 1
 
     final_api_parts = []
     for name_in_order in method_names_ordered:
         found_api = next((api for api in processed_apis if api["method_name"] == name_in_order), None)
         if found_api:
-            # The implementation in found_api is already correctly indented or is a placeholder
             final_api_parts.append(f"{found_api['docstring']}\n{found_api['signature']}\n{found_api['implementation']}\n")
         else:
             print(f"Warning: Method {name_in_order} was unexpectedly missing from processed_apis list.")
@@ -3394,6 +3738,7 @@ def api_agent(predef_signatures, gen_signatures, gen_docstrings, query):
     merged_api = "\n".join(final_api_parts)
     # shutil.rmtree(temp_test_base_dir) # Optional
     return merged_api.replace("\t", "    ")
+    
 def main_real():
     # User-specified paths
     actual_json_path = "../Data/train_sample/train_sample.json"
@@ -3913,6 +4258,7 @@ import re
 
 def extract_answer_from_result(query: str, result: str):
     # Extract all decimal or integer numbers
+    normalized = None
     numbers = re.findall(r'\d+\.\d+|\d+', result)
     if numbers:
         # Return as floats if any decimal is present, else as ints
@@ -3928,10 +4274,12 @@ def extract_answer_from_result(query: str, result: str):
     # Normalize based on yes/no response and spatial query
     if 'yes' in result_lower or 'no' in result_lower:
         prompt = (
-            f"Given the question: '{query}' and the answer: '{result}', "
-            "Determine if the correct response is 'left' or 'right'.\n"
-            "Respond with 'left' or 'right' only if the answer is clearly binary (i.e. 'yes' or 'no').\n"
-            "If the answer is ambiguous, not found, or not binary, respond with None."
+            f"Given a question: '{query}'\n"
+            f"And an answer: '{result}'\n\n"
+            "Your task is to infer whether the correct directional response should be 'left' or 'right'.\n"
+            "- If the answer is binary (i.e., clearly a 'yes' or 'no' answer), use both the question and the answer to determine whether the direction should be 'left' or 'right'.\n"
+            "- If the answer is not binary (e.g., contains phrases like 'not found', 'no suitable pallets', 'unknown', etc.), then respond with None.\n\n"
+            "Only respond with 'left', 'right', or None. Do not explain or include any other text."
         )
         try:
             normalized, _ = generate(prompt=prompt, enable_thinking=False, temperature=0.1)
@@ -4070,12 +4418,12 @@ def process_query(processed_instance_data):
         else:
             html_trace_output = error_trace_html
         
-        # Ensure spatialrgpt_generator is available (it's global)
-        global spatialrgpt_generator # This line makes sure we are referring to the global one
-        if spatialrgpt_generator:
+        # Ensure gemini_generator is available (it's global)
+        global gemini_generator # This line makes sure we are referring to the global one
+        if gemini_generator:
             temp_image_path = None
             try:
-                # Need to save PIL image to a temporary path for spatialrgpt_generator's wrapper
+                # Need to save PIL image to a temporary path for gemini_generator's wrapper
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img_file:
                     test_image_pil.save(tmp_img_file.name)
                     temp_image_path = tmp_img_file.name
@@ -4085,8 +4433,6 @@ def process_query(processed_instance_data):
                 
                 # The generate_vl function handles GeneratorVL instance internally
                 fallback_response = _vqa_predict(img=test_image_pil,
-                    depth=depth_path,
-                    masks=[det_obj.segmentation_mask_2d for det_obj in detected_objects_list],
                     question=f"{vqa_fallback_question_formatted}",
                 )
                 final_result = fallback_response # Override final_result with fallback
@@ -4274,23 +4620,24 @@ if __name__ == "__main__":
     # main_combined()
     
     # 2. Batch processing mode (process multiple annotations)
-    results = main_batch_processing()  # Process annotations at all indices
-    if results is not None:
-        with open("batch_results.json", "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+    # results = main_batch_processing()  # Process annotations at all indices
+    # if results is not None:
+    #     with open("batch_results.json", "w", encoding="utf-8") as f:
+    #         json.dump(results, f, ensure_ascii=False, indent=2)
 
-        print("Results saved to batch_results.json")
-    else:
-        print("No results to save.")
+    #     print("Results saved to batch_results.json")
+    # else:
+    #     print("No results to save.")
 
-    print(results)
+    # print(results)
     
     # 3. Standalone processor (requires processed_instance_data)
     # main_processor(your_processed_instance_data)
     
     # Default: Interactive mode
-    # result = main_combined()
-    # print(result)
+    while True:
+        result = main_combined()
+        print(result)
     # Save to a JSON file if results are not None
 
 

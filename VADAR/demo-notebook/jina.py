@@ -1,32 +1,26 @@
 from sentence_transformers import SentenceTransformer, util
-# Load a pre-trained embedding model (only once)
-embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', trust_remote_code=True)
+import torch
+from typing import Tuple
 
-from typing import List
-from sklearn.metrics.pairwise import cosine_similarity
+# Load the sentence-transformers model
+model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L6-v2')
 
-def is_similar_text(text1: str, text2: str) -> bool:
-    """
-    Determine whether two texts are semantically similar using cosine similarity.
+def get_text_embedding(text: str) -> torch.Tensor:
+  embedding = model.encode(text, convert_to_tensor=True, normalize_embeddings=True)
+  return embedding
 
-    Args:
-        text1 (str): First text input.
-        text2 (str): Second text input.
+def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+  return util.cos_sim(a, b).item()
 
-    Returns:
-        bool: True if similarity is above threshold, False otherwise.
-    """
-    threshold = 0.6
-    prompt_embedding = embedding_model.encode([text1], convert_to_numpy=True)
-    class_embedding = embedding_model.encode([text2], convert_to_numpy=True)
+def is_similar_text(text1: str, text2: str, threshold: float = 0.6) -> bool:
+  embedding1 = get_text_embedding(text1)
+  embedding2 = get_text_embedding(text2)
+  similarity = cosine_sim(embedding1, embedding2)
+  print(f"Cosine similarity: {similarity}")
+  return similarity > threshold
 
-    similarity = cosine_similarity(prompt_embedding, class_embedding)[0][0]
-    print(f"Cosine similarity: {similarity}")
-    return similarity > threshold
-
-print('loaded')
+print("SentenceTransformer model loaded.")
 while True:
-    input_A = input()
-    input_B = input()
-    print(is_similar_text(input_A, input_B))
-    
+  input_A = input("Text A: ")
+  input_B = input("Text B: ")
+  print("Similar:", is_similar_text(input_A, input_B))
