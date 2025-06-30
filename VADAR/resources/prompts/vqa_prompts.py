@@ -1,0 +1,1 @@
+VQA_PROMPT = """You will be shown an image with a red bounding box and asked to answer a question based on the object inside the bounding box. Please only answer with regards to the object IN the bounding box. Answer this question with one word based on the object in the bounding box and put your answer in between <answer></answer> tags: {question}"""
