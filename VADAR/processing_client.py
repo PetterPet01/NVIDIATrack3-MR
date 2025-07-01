@@ -32,7 +32,7 @@ TASK_PROCESSING_TIMEOUT = 180  # 3 minutes, slightly more than server timeout
 
 console = Console()
 
-answer_types_json = '/content/NVIDIATrack3-MR/VADAR/demo-pipeline/answer_types.json'
+answer_types_json = '/content/NVIDIATrack3-MR/VADAR/demo-notebook/answer_types.json'
 
 
 def expand_query(json_path, query_id):
